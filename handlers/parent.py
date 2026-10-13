@@ -25,8 +25,6 @@ def get_contact_keyboard() -> ReplyKeyboardMarkup:
         one_time_keyboard=True
     )
 
-# --- 1. /start: Ota-ona yoki Mehmon uchun kirish ---
-@parent_router.message(CommandStart(), F.func(lambda msg, user_role=None: user_role in [UserRole.PARENT, UserRole.GUEST] if user_role else True))
 async def parent_start(message: types.Message, db: Database, user_role: UserRole):
     # Agar allaqachon ota-ona sifatida ro'yxatdan o'tgan bo'lsa
     if user_role == UserRole.PARENT:
@@ -71,7 +69,7 @@ async def process_parent_contact(message: types.Message, db: Database):
     matched_students = await db.find_students_by_phone(norm_phone)
     if not matched_students:
         await message.answer(
-            "❌ Raqamingiz tizimdan topilmadi. Iltimos, o'quv markaz ma'muriyatiga murojaat qiling.",
+            "❌ Raqamingiz tizimdan topilmadi. Iltimos, o'quv markaz ma'muriyatiga murojaat qiling:\n📞 +998772602020",
             reply_markup=ReplyKeyboardRemove()
         )
         return

@@ -113,6 +113,7 @@ async def cb_noop(callback: types.CallbackQuery):
 # 1. /qishloqlar — Mahallalar va marshrut tartibi
 # ============================================================================
 @admin_router.message(Command("qishloqlar"))
+@admin_router.message(F.text == "🏘 Mahallalar")
 async def cmd_qishloqlar(message: types.Message, db: Database):
     if not is_admin(message.from_user.id):
         await message.answer("Ushbu buyruq faqat adminlar uchun!")
@@ -227,6 +228,7 @@ async def process_village_pickup(message: types.Message, state: FSMContext, db: 
 # 2. /haydovchilar — Haydovchilar boshqaruvi
 # ============================================================================
 @admin_router.message(Command("haydovchilar"))
+@admin_router.message(F.text == "🚗 Haydovchilar")
 async def cmd_haydovchilar(message: types.Message, db: Database):
     if not is_admin(message.from_user.id):
         await message.answer("Ushbu buyruq faqat adminlar uchun!")
@@ -326,6 +328,7 @@ async def process_driver_phone(message: types.Message, state: FSMContext, db: Da
 # 3. /xodimlar — Xodimlar boshqaruvi
 # ============================================================================
 @admin_router.message(Command("xodimlar"))
+@admin_router.message(F.text == "👥 Xodimlar")
 async def cmd_xodimlar(message: types.Message, db: Database):
     if not is_admin(message.from_user.id):
         await message.answer("Ushbu buyruq faqat adminlar uchun!")
@@ -429,6 +432,7 @@ async def process_staff_phone(message: types.Message, state: FSMContext, db: Dat
 # 4. /qoshish — O'quvchi qo'shish (FSM)
 # ============================================================================
 @admin_router.message(Command("qoshish"))
+@admin_router.message(F.text == "➕ O'quvchi qo'shish")
 async def cmd_qoshish(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         await message.answer("Ushbu buyruq faqat adminlar uchun!")
@@ -715,6 +719,7 @@ async def process_new_phone1(message: types.Message, state: FSMContext, db: Data
 # 6. /ochirish — O'quvchini tizimdan nofaol qilish (o'chirish)
 # ============================================================================
 @admin_router.message(Command("ochirish"))
+@admin_router.message(F.text == "🗑 O'quvchini o'chirish")
 async def cmd_ochirish(message: types.Message, state: FSMContext, db: Database):
     if not is_admin(message.from_user.id):
         await message.answer("Ushbu buyruq faqat adminlar uchun!")
@@ -779,6 +784,7 @@ async def cb_execute_delete(callback: types.CallbackQuery, state: FSMContext, db
 # 7. /jadval — O'quvchi dars jadvalini ko'rish va tahrirlash
 # ============================================================================
 @admin_router.message(Command("jadval"))
+@admin_router.message(F.text == "📅 Dars jadvali")
 async def cmd_jadval(message: types.Message, state: FSMContext, db: Database):
     if not is_admin(message.from_user.id):
         await message.answer("Ushbu buyruq faqat adminlar uchun!")
@@ -906,6 +912,7 @@ async def cb_admin_approve_trips(callback: types.CallbackQuery, db: Database):
 PENDING_EXCEL_IMPORTS = {}
 
 @admin_router.message(Command("shablon"))
+@admin_router.message(F.text == "📊 Excel shablon")
 async def cmd_admin_template(message: types.Message):
     if not is_admin(message.from_user.id):
         return
@@ -1164,6 +1171,7 @@ async def cb_admin_delay_cancel(callback: types.CallbackQuery):
 PENDING_BROADCASTS = {}
 
 @admin_router.message(Command("xabar"))
+@admin_router.message(F.text == "📢 Xabar yuborish")
 async def cmd_admin_broadcast(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
