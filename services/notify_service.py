@@ -1,6 +1,8 @@
 from typing import Optional, List
 from aiogram import Bot
 from database.db import Database
+from utils.text import escape_html
+from utils.telegram import safe_telegram_call
 
 class NotifyService:
     @staticmethod
@@ -25,9 +27,10 @@ class NotifyService:
         for p in parents:
             status = "sent"
             if bot and p.get("telegram_id"):
-                try:
-                    await bot.send_message(chat_id=p["telegram_id"], text=text, parse_mode="HTML")
-                except Exception:
+                sent = await safe_telegram_call(
+                    bot.send_message, chat_id=p["telegram_id"], text=text, parse_mode="HTML"
+                )
+                if not sent:
                     status = "failed"
             
             log_id = await db.log_notification(
@@ -64,8 +67,8 @@ class NotifyService:
                 continue
 
             msg_text = text_template.format(
-                full_name=item["full_name"],
-                village_name=item["village_name"],
+                full_name=escape_html(item["full_name"]),
+                village_name=escape_html(item["village_name"]),
                 travel_minutes=item.get("travel_minutes", 15)
             )
 

@@ -6,13 +6,14 @@ from aiogram.client.default import DefaultBotProperties
 
 from config import settings
 from database.db import Database
-from middlewares.roles import RoleMiddleware
+from middlewares.roles import RoleMiddleware, TelegramApiFailureMiddleware, InvalidCallbackMiddleware
 from handlers.common import common_router
 from handlers.admin import admin_router
 from handlers.driver import driver_router
 from handlers.staff import staff_router
 from handlers.parent import parent_router
 from services.scheduler_service import SchedulerService
+from middlewares.sqlite_storage import SQLiteFSMStorage
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,7 +30,8 @@ async def main():
         token=settings.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
-    dp = Dispatcher()
+    fsm_storage = SQLiteFSMStorage(db)
+    dp = Dispatcher(storage=fsm_storage)
 
     # Dependency Injection
     dp["db"] = db
@@ -37,6 +39,9 @@ async def main():
     # Middleware: Rolni aniqlash (barcha xabar va callbacklarda)
     dp.message.middleware(RoleMiddleware(db))
     dp.callback_query.middleware(RoleMiddleware(db))
+    dp.message.middleware(TelegramApiFailureMiddleware())
+    dp.callback_query.middleware(TelegramApiFailureMiddleware())
+    dp.callback_query.middleware(InvalidCallbackMiddleware())
 
     # Routerlarni qat'iy ketma-ketlikda ulash
     dp.include_router(common_router)
@@ -56,6 +61,7 @@ async def main():
         logger.info("Bot to'xtatilmoqda (Graceful shutdown)...")
         scheduler.stop()
         await bot.session.close()
+        await fsm_storage.close()
 
 if __name__ == "__main__":
     try:

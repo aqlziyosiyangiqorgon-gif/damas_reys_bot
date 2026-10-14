@@ -3,6 +3,7 @@ import os
 import shutil
 import time
 import uuid
+import sqlite3
 from datetime import datetime
 
 from config import settings, get_default_db_path, get_default_backup_dir
@@ -48,6 +49,9 @@ async def test_phase_10_railway_deploy_and_volume():
         # 2.1 Yangi zaxira olish
         created_backup = scheduler.run_backup_db(db_path=test_vol_db_path, backup_dir=test_backup_dir)
         assert os.path.exists(created_backup)
+        with sqlite3.connect(created_backup) as backup_conn:
+            assert backup_conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert backup_conn.execute("SELECT COUNT(*) FROM villages").fetchone()[0] == 10
 
         # 2.2 Soxta eski (10 kunlik) va yangi (2 kunlik) zaxira fayllar yaratish
         old_file = os.path.join(test_backup_dir, "damas_reys_20261001.db")

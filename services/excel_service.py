@@ -1,3 +1,4 @@
+from utils.time import now_tashkent
 import os
 import openpyxl
 from typing import List, Dict, Any, Optional, Tuple
@@ -149,8 +150,11 @@ class ExcelService:
                         st = parts[0].strip()
                         et = parts[1].strip()
                         try:
-                            datetime.strptime(st, "%H:%M")
-                            datetime.strptime(et, "%H:%M")
+                            start_time = datetime.strptime(st, "%H:%M")
+                            end_time = datetime.strptime(et, "%H:%M")
+                            if end_time <= start_time:
+                                sched_error = f"{day_name.capitalize()} dars tugash vaqti boshlanishidan keyin bo'lishi kerak"
+                                break
                             schedules.append({"weekday": day_num, "start_time": st, "end_time": et})
                         except ValueError:
                             sched_error = f"{day_name.capitalize()} soati noto'g'ri: {time_val}"
@@ -198,7 +202,7 @@ class ExcelService:
         yagona chiroyli formatlangan .xlsx faylga eksport qilish.
         """
         if not output_path:
-            output_path = f"baza_oquvchilar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            output_path = f"baza_oquvchilar_{now_tashkent().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -240,10 +244,10 @@ class ExcelService:
                 sched_map = {row["weekday"]: f"{row['start_time']}-{row['end_time']}" for row in sched_rows}
 
                 row = [
-                    s["full_name"],
-                    s.get("village_name") or "",
-                    s.get("parent_phone_1") or "",
-                    s.get("parent_phone_2") or "",
+                    _excel_safe_text(s["full_name"]),
+                    _excel_safe_text(s.get("village_name") or ""),
+                    _excel_safe_text(s.get("parent_phone_1") or ""),
+                    _excel_safe_text(s.get("parent_phone_2") or ""),
                     sched_map.get(0, ""),
                     sched_map.get(1, ""),
                     sched_map.get(2, ""),
@@ -263,4 +267,12 @@ class ExcelService:
             return output_path
         finally:
             await conn.close()
+
+
+def _excel_safe_text(value: Any) -> str:
+    """Prevent user-controlled strings from being interpreted as spreadsheet formulas."""
+    text = str(value if value is not None else "")
+    if text.lstrip().startswith("="):
+        return "'" + text
+    return text
 

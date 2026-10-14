@@ -1,6 +1,8 @@
+from utils.time import now_tashkent
 import os
+import json
 import aiosqlite
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from models.enums import UserRole
 
@@ -59,13 +61,15 @@ class Database:
         conn = await aiosqlite.connect(self.db_path)
         conn.row_factory = aiosqlite.Row
         await conn.execute("PRAGMA foreign_keys = ON;")
-        await conn.execute("PRAGMA journal_mode = WAL;")
         await conn.execute("PRAGMA busy_timeout = 5000;")
         return conn
 
     async def init_db(self):
         conn = await self.get_connection()
         try:
+            # WAL is a database-level setting; set it once at startup instead of
+            # asking every short-lived connection to change/check journal mode.
+            await conn.execute("PRAGMA journal_mode = WAL;")
             await conn.executescript("""
             -- 1. Zonalar
             CREATE TABLE IF NOT EXISTS zones (
@@ -219,6 +223,20 @@ class Database:
                 sent INTEGER NOT NULL DEFAULT 0,
                 failed INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS fsm_storage (
+                storage_key TEXT PRIMARY KEY,
+                state TEXT,
+                data TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS workflow_payloads (
+                batch_id TEXT PRIMARY KEY,
+                admin_tg_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """)
 
             # Boshlang'ich zonalar
@@ -243,6 +261,53 @@ class Database:
             if "reason" not in columns:
                 await conn.execute("ALTER TABLE absences ADD COLUMN reason TEXT")
 
+            await conn.commit()
+        finally:
+            await conn.close()
+
+    async def save_workflow_payload(self, batch_id: str, admin_tg_id: int, kind: str, payload: Dict[str, Any]) -> None:
+        conn = await self.get_connection()
+        try:
+            await conn.execute(
+                "DELETE FROM workflow_payloads WHERE created_at < ?",
+                ((now_tashkent() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),),
+            )
+            await conn.execute(
+                "INSERT OR REPLACE INTO workflow_payloads (batch_id, admin_tg_id, kind, payload, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (batch_id, admin_tg_id, kind, json.dumps(payload, ensure_ascii=False),
+                 now_tashkent().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+
+    async def take_workflow_payload(self, batch_id: str, admin_tg_id: int, kind: str) -> Optional[Dict[str, Any]]:
+        """Atomically consume a persisted admin confirmation payload once."""
+        conn = await self.get_connection()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            cur = await conn.execute(
+                "SELECT payload FROM workflow_payloads WHERE batch_id = ? AND admin_tg_id = ? AND kind = ?",
+                (batch_id, admin_tg_id, kind),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await conn.rollback()
+                return None
+            await conn.execute("DELETE FROM workflow_payloads WHERE batch_id = ?", (batch_id,))
+            await conn.commit()
+            return json.loads(row["payload"])
+        finally:
+            await conn.close()
+
+    async def delete_workflow_payload(self, batch_id: str, admin_tg_id: int) -> None:
+        conn = await self.get_connection()
+        try:
+            await conn.execute(
+                "DELETE FROM workflow_payloads WHERE batch_id = ? AND admin_tg_id = ?",
+                (batch_id, admin_tg_id),
+            )
             await conn.commit()
         finally:
             await conn.close()
@@ -390,7 +455,7 @@ class Database:
     async def add_parent(self, telegram_id: int, phone: str, registered_at: Optional[str] = None) -> int:
         if not registered_at:
             from datetime import datetime
-            registered_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            registered_at = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
         norm_phone = normalize_phone(phone)
         if not norm_phone:
             raise ValueError(f"Ota-ona telefon raqami noto'g'ri: {phone}")
@@ -687,7 +752,7 @@ class Database:
 
     async def link_student_parent(self, student_id: int, parent_id: int) -> bool:
         from datetime import datetime
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
         conn = await self.get_connection()
         try:
             await conn.execute("""
@@ -738,7 +803,7 @@ class Database:
         student_id: Optional[int] = None
     ) -> int:
         from datetime import datetime
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
         conn = await self.get_connection()
         try:
             cur = await conn.execute("""
@@ -819,6 +884,104 @@ class Database:
         finally:
             await conn.close()
 
+    async def claim_item(
+        self,
+        item_id: int,
+        trip_id: int,
+        from_statuses: List[str],
+        to_status: str,
+        ts_col: str,
+        ts: str,
+        actor_id: int,
+        *,
+        trip_statuses: Optional[List[str]] = None,
+        direction: Optional[str] = None,
+        actor_tg_id: Optional[int] = None,
+        event_action: Optional[str] = None
+    ) -> bool:
+        """K5: bola holati faqat kutilgan oldingi holatdan o'zgaradi (double-tap va eskirgan tugma himoyasi)."""
+        if ts_col not in ("picked_at", "arrived_at", "accepted_at", "handed_at", "dropped_at"):
+            raise ValueError(f"Noto'g'ri ustun: {ts_col}")
+        if not from_statuses:
+            return False
+        placeholders = ",".join("?" * len(from_statuses))
+        trip_conditions = ["t.id = ti.trip_id", "t.id = ?"]
+        params: List[Any] = [to_status, ts, actor_id, item_id, trip_id, *from_statuses, trip_id]
+        if trip_statuses is not None:
+            if not trip_statuses:
+                return False
+            trip_conditions.append(f"t.status IN ({','.join('?' * len(trip_statuses))})")
+            params.extend(trip_statuses)
+        if direction is not None:
+            trip_conditions.append("t.direction = ?")
+            params.append(direction)
+        conn = await self.get_connection()
+        try:
+            cur = await conn.execute(
+                f"UPDATE trip_items AS ti SET status = ?, {ts_col} = ?, actor_id = ? "
+                f"WHERE ti.id = ? AND ti.trip_id = ? AND ti.status IN ({placeholders}) "
+                f"AND EXISTS (SELECT 1 FROM trips t WHERE {' AND '.join(trip_conditions)})",
+                params
+            )
+            if cur.rowcount == 1 and event_action:
+                await conn.execute(
+                    "INSERT INTO event_log (ts, actor_role, actor_id, action, trip_id, student_id) "
+                    "SELECT ?, 'driver', ?, ?, ti.trip_id, ti.student_id FROM trip_items ti WHERE ti.id = ?",
+                    (ts, actor_tg_id if actor_tg_id is not None else actor_id, event_action, item_id)
+                )
+            await conn.commit()
+            return cur.rowcount == 1
+        finally:
+            await conn.close()
+
+    async def transition_trip(
+        self,
+        trip_id: int,
+        from_statuses: List[str],
+        to_status: str,
+        started_at: Optional[str] = None,
+        finished_at: Optional[str] = None,
+        *,
+        direction: Optional[str] = None,
+        actor_tg_id: Optional[int] = None,
+        event_action: Optional[str] = None,
+        require_all_items_complete: bool = False
+    ) -> bool:
+        """K5: reys holati faqat ruxsat etilgan oldingi holatdan o'zgaradi."""
+        if not from_statuses:
+            return False
+        placeholders = ",".join("?" * len(from_statuses))
+        conditions = [f"id = ?", f"status IN ({placeholders})"]
+        params: List[Any] = [to_status, started_at, finished_at, trip_id, *from_statuses]
+        if direction is not None:
+            conditions.append("direction = ?")
+            params.append(direction)
+        if require_all_items_complete:
+            conditions.append(
+                "NOT EXISTS (SELECT 1 FROM trip_items ti WHERE ti.trip_id = trips.id "
+                "AND ti.status NOT IN ('dropped_off', 'absent'))"
+            )
+        conn = await self.get_connection()
+        try:
+            cur = await conn.execute(
+                f"UPDATE trips SET status = ?, "
+                f"started_at = coalesce(?, started_at), "
+                f"finished_at = coalesce(?, finished_at) "
+                f"WHERE {' AND '.join(conditions)}",
+                params
+            )
+            if cur.rowcount == 1 and event_action:
+                await conn.execute(
+                    "INSERT INTO event_log (ts, actor_role, actor_id, action, trip_id) "
+                    "VALUES (?, 'driver', ?, ?, ?)",
+                    (started_at or finished_at or now_tashkent().strftime("%Y-%m-%d %H:%M:%S"),
+                     actor_tg_id if actor_tg_id is not None else 0, event_action, trip_id)
+                )
+            await conn.commit()
+            return cur.rowcount == 1
+        finally:
+            await conn.close()
+
     async def update_trip_status(
         self,
         trip_id: int,
@@ -876,9 +1039,10 @@ class Database:
         Bir mahalladagi barcha kutayotgan (pending) bolalarni birdaniga mashinaga olish.
         """
         from datetime import datetime
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
         conn = await self.get_connection()
         try:
+            await conn.execute("BEGIN IMMEDIATE")
             # Haydovchini aniqlash (id yoki telegram_id)
             cur_driver = await conn.execute(
                 "SELECT id, telegram_id FROM drivers WHERE id = ? OR telegram_id = ?",
@@ -891,9 +1055,10 @@ class Database:
             actor_tg_id = d_row["telegram_id"] or real_driver_id
 
             # Reysni tekshirish
-            cur_trip = await conn.execute("SELECT id, driver_id, status FROM trips WHERE id = ?", (trip_id,))
+            cur_trip = await conn.execute("SELECT id, driver_id, status, direction FROM trips WHERE id = ?", (trip_id,))
             trip_row = await cur_trip.fetchone()
-            if not trip_row or trip_row["driver_id"] != real_driver_id:
+            if (not trip_row or trip_row["driver_id"] != real_driver_id
+                    or trip_row["status"] != "on_way" or trip_row["direction"] != "to_center"):
                 return []
 
             # Shu mahalladagi barcha pending bolalar
@@ -933,9 +1098,10 @@ class Database:
         Bir mahalladagi barcha yetkazilmagan bolalarni birdaniga uyiga yetkazish.
         """
         from datetime import datetime
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
         conn = await self.get_connection()
         try:
+            await conn.execute("BEGIN IMMEDIATE")
             # Haydovchini aniqlash (id yoki telegram_id)
             cur_driver = await conn.execute(
                 "SELECT id, telegram_id FROM drivers WHERE id = ? OR telegram_id = ?",
@@ -948,9 +1114,10 @@ class Database:
             actor_tg_id = d_row["telegram_id"] or real_driver_id
 
             # Reysni tekshirish
-            cur_trip = await conn.execute("SELECT id, driver_id, status FROM trips WHERE id = ?", (trip_id,))
+            cur_trip = await conn.execute("SELECT id, driver_id, status, direction FROM trips WHERE id = ?", (trip_id,))
             trip_row = await cur_trip.fetchone()
-            if not trip_row or trip_row["driver_id"] != real_driver_id:
+            if (not trip_row or trip_row["driver_id"] != real_driver_id
+                    or trip_row["status"] != "on_way" or trip_row["direction"] != "to_home"):
                 return []
 
             # Shu mahalladagi barcha hali yetkazilmagan va kelmaydi bo'lmagan bolalar
@@ -961,7 +1128,8 @@ class Database:
                 FROM trip_items ti
                 JOIN students s ON ti.student_id = s.id
                 JOIN villages v ON ti.village_id = v.id
-                WHERE ti.trip_id = ? AND ti.village_id = ? AND ti.status NOT IN ('dropped_off', 'absent')
+                WHERE ti.trip_id = ? AND ti.village_id = ?
+                  AND ti.status IN ('pending', 'handed_over', 'arrived', 'accepted')
             """, (trip_id, village_id))
             items = [dict(r) for r in await cur.fetchall()]
             if not items:
@@ -1004,7 +1172,7 @@ class Database:
         status: str = "sent"
     ) -> int:
         from datetime import datetime
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
         conn = await self.get_connection()
         try:
             cur = await conn.execute("""
@@ -1078,9 +1246,10 @@ class Database:
 
     async def accept_student(self, item_id: int, staff_id: int) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         from datetime import datetime
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
         conn = await self.get_connection()
         try:
+            await conn.execute("BEGIN IMMEDIATE")
             cur = await conn.execute("""
                 SELECT ti.*, t.status as trip_status, t.direction
                 FROM trip_items ti
@@ -1129,9 +1298,10 @@ class Database:
 
     async def accept_all_trip_students(self, trip_id: int, staff_id: int) -> Tuple[bool, str, List[Dict[str, Any]]]:
         from datetime import datetime
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
         conn = await self.get_connection()
         try:
+            await conn.execute("BEGIN IMMEDIATE")
             cur_t = await conn.execute("SELECT * FROM trips WHERE id = ?", (trip_id,))
             trip = await cur_t.fetchone()
             if not trip:
@@ -1171,9 +1341,10 @@ class Database:
 
     async def handover_student(self, item_id: int, staff_id: int) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         from datetime import datetime
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
         conn = await self.get_connection()
         try:
+            await conn.execute("BEGIN IMMEDIATE")
             cur = await conn.execute("""
                 SELECT ti.*, t.status as trip_status, t.direction
                 FROM trip_items ti
@@ -1184,6 +1355,12 @@ class Database:
             if not row:
                 return False, "item_not_found", None
             item = dict(row)
+
+            if item["direction"] != "to_home":
+                return False, "wrong_direction", item
+
+            if item["status"] in ("picked_up", "dropped_off"):
+                return False, "invalid_state", item
 
             if item["status"] == "handed_over":
                 return False, "already_handed_over", item
@@ -1213,13 +1390,17 @@ class Database:
 
     async def handover_all_trip_students(self, trip_id: int, staff_id: int) -> Tuple[bool, str, List[Dict[str, Any]]]:
         from datetime import datetime
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
         conn = await self.get_connection()
         try:
+            await conn.execute("BEGIN IMMEDIATE")
             cur_t = await conn.execute("SELECT * FROM trips WHERE id = ?", (trip_id,))
             trip = await cur_t.fetchone()
             if not trip:
                 return False, "trip_not_found", []
+
+            if trip["direction"] != "to_home":
+                return False, "wrong_direction", []
 
             cur_items = await conn.execute("""
                 SELECT * FROM trip_items
@@ -1271,11 +1452,18 @@ class Database:
         Kunlik generatsiya qilingan reyslarni bazaga yozish.
         Faol/yakunlangan reyslar bo'lsa rad etiladi.
         """
-        if await self.check_existing_active_trips(date_str):
-            return False
-
         conn = await self.get_connection()
         try:
+            # Serialize plan replacement so concurrent invocations cannot interleave writes.
+            await conn.execute("BEGIN IMMEDIATE")
+            cur_active = await conn.execute(
+                "SELECT 1 FROM trips WHERE date = ? AND status IN ('on_way', 'at_center', 'handed_over', 'done') LIMIT 1",
+                (date_str,),
+            )
+            if await cur_active.fetchone():
+                await conn.rollback()
+                return False
+
             # Ushbu sanadagi hali tasdiqlanmagan eski rejalarni tozalash
             cur_old = await conn.execute(
                 "SELECT id FROM trips WHERE date = ? AND approved = 0",
@@ -1344,7 +1532,7 @@ class Database:
             await conn.commit()
 
             if count > 0:
-                now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                now_ts = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
                 await conn.execute("""
                     INSERT INTO event_log (ts, actor_role, actor_id, action)
                     VALUES (?, ?, ?, ?)
@@ -1474,7 +1662,7 @@ class Database:
 
             # SATR: ALLAQACHON MASHINADA BO'LSA HIMOYA
             for it in trip_items:
-                if it["item_status"] in ["picked_up", "arrived", "accepted", "dropped_off"]:
+                if it["item_status"] in ["picked_up", "arrived", "accepted", "dropped_off", "handed_over"]:
                     return False, "already_picked_up", None
 
             # Absences jadvalida bor-yo'qligini tekshirish
@@ -1505,7 +1693,7 @@ class Database:
                     }
 
             # Audit log
-            now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now_ts = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
             await conn.execute("""
                 INSERT INTO event_log (ts, actor_role, actor_id, action, student_id)
                 VALUES (?, ?, ?, 'mark_absent', ?)
@@ -1594,7 +1782,7 @@ class Database:
                     }
 
             # Audit log
-            now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now_ts = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
             await conn.execute("""
                 INSERT INTO event_log (ts, actor_role, actor_id, action, student_id)
                 VALUES (?, ?, ?, 'mark_absent', ?)
@@ -1795,7 +1983,7 @@ class Database:
                 it["parents"] = [dict(r) for r in await cur_p.fetchall()]
                 it["is_picked_up"] = (it["item_status"] in ["picked_up", "arrived", "accepted"])
 
-            now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            now_ts = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
             await conn.execute("""
                 INSERT INTO event_log (ts, actor_role, actor_id, action, trip_id)
                 VALUES (?, 'admin', ?, 'trip_delay', ?)
@@ -1900,7 +2088,7 @@ class Database:
         failed: int
     ) -> int:
         from datetime import datetime
-        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_ts = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
         conn = await self.get_connection()
         try:
             cur = await conn.execute("""

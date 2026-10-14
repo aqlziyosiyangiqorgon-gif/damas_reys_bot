@@ -1,83 +1,59 @@
-# Damas Reys Boti 🚐
+# AQL ZIYOSI transport boti
 
-O'quv markaz atrofidagi 7 ta qishloqdan o'quvchilarni Damas (sig'imi 8 kishi) bilan olib kelish va uyiga eltib qo'yish jadvalini avtomatik tuzish hamda haydovchiga yetkazish boti.
+O'quvchilarni Damas transportida markazga olib kelish va uyiga qaytarishni rejalashtiradi. Ota-onalarga yo'l holati va kelmaslik xabarlari yuboriladi; adminlar jadval, o'quvchi, haydovchi va xodimlarni boshqaradi.
 
 ## Texnologiyalar
-- **Python 3.11+**
-- **aiogram 3.x**
-- **aiosqlite** (Asinxron SQLite)
-- **APScheduler**
-- **pydantic-settings**
-- **pytest** (Unit testlar uchun)
 
----
+- Python 3.11+
+- aiogram 3.15, aiosqlite va SQLite (WAL)
+- APScheduler 3.10; rejalashtirilgan vaqtlar `Asia/Tashkent` bo'yicha
+- openpyxl (Excel import va eksport)
+- pytest va pytest-asyncio
 
-## O'rnatish va Ishga Tushirish
+## Mahalliy ishga tushirish
 
-1. **Repozitoriyga o'ting va virtual muhit yarating:**
-   ```bash
-   cd damas_reys_bot
-   python -m venv venv
-   # Windows:
-   venv\Scripts\activate
-   # Linux/macOS:
-   source venv/bin/activate
-   ```
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
 
-2. **Kutubxonalarni o'rnating:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+`.env` ichida kamida `BOT_TOKEN` va `ADMIN_IDS` qiymatlarini sozlang. `ADMIN_IDS` — vergul bilan ajratilgan Telegram ID’lar. Boshqa sozlamalar uchun `.env.example`ga qarang.
 
-3. **.env faylini sozlang:**
-   `.env.example` dan `.env` nusxasini yarating va ma'lumotlarni to'ldiring:
-   ```env
-   BOT_TOKEN=telegram_bot_tokeningiz
-   ADMIN_IDS=123456789,987654321
-   DRIVER_ID=123456789
-   CAPACITY=8
-   GROUP_WINDOW_MIN=20
-   MIN_GAP_BETWEEN_TRIPS_MIN=40
-   PICKUP_LEAD_MIN=30
-   DAILY_PLAN_TIME=06:30
-   DB_PATH=damas_reys.db
-   ```
+```powershell
+python -m pytest -q
+python main.py
+```
 
-4. **Testlarni ishga tushirish:**
-   ```bash
-   pytest tests
-   ```
+SQLite fayli `DB_PATH`da saqlanadi. FSM jarayonlari ham shu bazada saqlanadi, shuning uchun bot qayta ishga tushganda admin va ota-ona formalaridagi holat saqlanadi. Excel import va broadcast tasdiqlari ham qisqa muddatga bazaga yoziladi.
 
-5. **Botni ishga tushirish:**
-   ```bash
-   python main.py
-   ```
+## Jadval va zaxira
 
----
+- Kunlik reja `DAILY_PLAN_TIME`da tuziladi.
+- Tasdiqlanmagan reyslar `AUTO_APPROVE_TIME`da avtomatik tasdiqlanadi.
+- Haydovchi eslatmalari har daqiqada ko'rib chiqiladi.
+- SQLite zaxirasi har kuni soat 23:00 da `BACKUP_DIR` ichiga onlayn SQLite backup API orqali olinadi. Standart saqlash muddati 7 kun (`BACKUP_RETENTION_DAYS`).
 
-## Railway.app platformasiga deploy qilish
+Zaxiralar bot serveridagi lokal fayllardir; Railway'da saqlanib qolishi uchun `BACKUP_DIR` ham Volume ichida bo'lishi kerak. Alohida tashqi zaxira xizmatiga nusxa yuborish hozircha sozlanmagan.
 
-1. [railway.app](https://railway.app) ga kiring va GitHub repozitoriyangizni ulang (**New Project** -> **Deploy from GitHub repo**).
-2. **Variables** bo'limida `.env` dagi barcha o'zgaruvchilarni kiriting:
-   - `BOT_TOKEN`
-   - `ADMIN_IDS`
-   - `DRIVER_ID`
-   - `CAPACITY`, `GROUP_WINDOW_MIN`, `MIN_GAP_BETWEEN_TRIPS_MIN`, `PICKUP_LEAD_MIN`, `DAILY_PLAN_TIME`
-   - `DB_PATH=/app/data/damas_reys.db` (doimiy saqlash uchun Volume ulang).
-3. **Volume qo'shish (Majburiy - SQLite uchun):**
-   - Service sozlamalaridan **Volumes** bo'limiga kiring va `/app/data` manziliga volume biriktiring.
-4. Deploy avtomatik tarzda `Procfile` yoki `python main.py` orqali ishga tushadi.
+## Railway deploy
 
----
+1. GitHub repozitoriyadan Railway service yarating.
+2. Service Variables bo'limida `BOT_TOKEN`, `ADMIN_IDS`, `DB_PATH`, `BACKUP_DIR` va kerakli ish sozlamalarini kiriting.
+3. Railway Volume'ni `/app/data` manziliga ulang. `DB_PATH=/app/data/damas_reys.db` va `BACKUP_DIR=/app/data/backups`dan foydalaning.
+4. Service'ni **bitta replica** bilan ishlating. `Procfile` worker jarayonini `python main.py` orqali ishga tushiradi.
 
-## Buyruqlar va Imkoniyatlar
-- `/qoshish` — FSM orqali o'quvchi qo'shish (F.I.SH, qishloq, ota-ona telefoni, kunlar, vaqt).
-- `/shablon` — O'quvchilarni ommaviy yuklash uchun Excel shablonini yuklab olish.
-- `Excel yuklash` — To'ldirilgan `.xlsx` faylni botga yuborish orqali barcha o'quvchilarni bir zumda bazaga kiritish.
-- `/ozgartirish` — Dars jadvalini o'zgartirish.
-- `/ochirish` — O'quvchini ro'yxatdan chiqarish.
-- `/bugun` va `/ertaga` — Avtomatik reys jadvalini hisoblash va haydovchiga yuborish tugmasi.
-- `/qishloqlar` — 7 ta qishloq va yo'l vaqtlari ro'yxati.
-- `/ota_ona` — Ota-onalar o'z telefon raqamlarini yuborib, botga bog'lanishadi.
-- **Haydovchi oqimi** — 30 daqiqa oldin eslatma, "Yo'lga chiqdim", har bola uchun "Oldim ✅" va "Yetkazdim ✅" tugmalari.
-- **Ota-ona bildirishnomalari** — Haydovchi tugmani bosishi bilan ota-onaga Telegram orqali farzandi mashinaga o'tirgani yoki uyga yetkazilgani haqida tezkor xabarnoma boradi.
+Deploydan keyin loglarda token yoki maxfiy qiymatlarni ulashmang. Volume yo'li noto'g'ri bo'lsa SQLite va backup fayllari deploylar orasida saqlanmasligi mumkin.
+
+## Asosiy admin buyruqlari
+
+- `/qoshish` — o'quvchi va dars jadvalini qo'shish
+- `/shablon` va `.xlsx` yuklash — ommaviy import; bot oldindan ko'rish va tasdiqlash so'raydi
+- `/haydovchilar`, `/xodimlar` — transport jamoasini boshqarish
+- `/qishloqlar` — marshrut va mahalla ma'lumotlari
+- `/jadval`, `/ozgartirish`, `/ochirish` — o'quvchi va jadvalni boshqarish
+- `/bugun`, `/ertaga` — reyslarni ko'rish va kunlik rejani boshqarish
+- `/xabar` — auditoriyaga xabar yuborish
+
+Ota-onalar `/start` orqali telefonlarini tasdiqlaydi, so'ng farzand bog'lanishini tasdiqlaydi. Haydovchi va markaz xodimlari faqat o'z vazifasiga tegishli reys amallarini bajaradi.

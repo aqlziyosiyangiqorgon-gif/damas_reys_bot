@@ -1,5 +1,6 @@
+from utils.time import now_tashkent
+import asyncio
 import os
-import shutil
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
@@ -14,6 +15,8 @@ from config import settings
 from database.db import Database
 from services.trip_builder import TripBuilder
 from models.enums import TripDirection, TripStatus
+from utils.text import escape_html
+from utils.telegram import safe_telegram_call
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +27,7 @@ class SchedulerService:
         self.tz_str = tz_str
         self.timezone = ZoneInfo(tz_str)
         self.scheduler = AsyncIOScheduler(timezone=self.timezone)
+        self._daily_plan_lock = asyncio.Lock()
 
     async def check_and_send_reminders(self, now_dt: Optional[datetime] = None) -> Dict[str, int]:
         """
@@ -84,8 +88,8 @@ class SchedulerService:
         header = "⏰ <b>1-eslatma: Reys vaqti yaqinlashmoqda!</b>" if reminder_num == 1 else "⚠️ <b>2-eslatma: Shoshiling! Reys vaqti yetib keldi.</b>"
         items_text = ""
         for idx, it in enumerate(trip.get("items", []), 1):
-            pickup = f" ({it['pickup_point']})" if it.get("pickup_point") else ""
-            items_text += f"  {idx}. {it['full_name']} — {it['village_name']}{pickup}\n"
+            pickup = f" ({escape_html(it['pickup_point'])})" if it.get("pickup_point") else ""
+            items_text += f"  {idx}. {escape_html(it['full_name'])} — {escape_html(it['village_name'])}{pickup}\n"
 
         text = (
             f"{header}\n\n"
@@ -100,10 +104,9 @@ class SchedulerService:
         ])
 
         if self.bot and driver_tg_id:
-            try:
-                await self.bot.send_message(chat_id=driver_tg_id, text=text, reply_markup=kb, parse_mode="HTML")
-            except Exception as e:
-                logger.error(f"Haydovchiga eslatma yuborishda xatolik: {e}")
+            await safe_telegram_call(
+                self.bot.send_message, chat_id=driver_tg_id, text=text, reply_markup=kb, parse_mode="HTML"
+            )
 
     async def _send_admin_escalation(self, trip: dict):
         driver_name = trip.get("driver_name") or "Biriktirilgan haydovchi"
@@ -111,7 +114,7 @@ class SchedulerService:
         dir_text = "Markazga kelish" if trip["direction"] == TripDirection.TO_CENTER.value else "Uyga qaytish"
         alert_text = (
             f"⚠️ <b>DIQQAT! Reysga javob berilmadi (Eskalatsiya)!</b>\n\n"
-            f"Haydovchi: <b>{driver_name}</b> (Tel: {driver_phone})\n"
+            f"Haydovchi: <b>{escape_html(driver_name)}</b> (Tel: {escape_html(driver_phone)})\n"
             f"Reys: <b>#{trip['id']}</b> ({dir_text})\n"
             f"Vaqti: <b>{trip['planned_time']}</b>\n\n"
             f"Haydovchi 2 ta eslatmaga ham javob bermadi va [🚗 Yo'ldaman] tugmasini bosmadi!"
@@ -119,12 +122,13 @@ class SchedulerService:
 
         if self.bot:
             for admin_id in settings.admin_ids_list:
-                try:
-                    await self.bot.send_message(chat_id=admin_id, text=alert_text, parse_mode="HTML")
-                except Exception as e:
-                    logger.error(f"Adminga eskalatsiya yuborishda xatolik: {e}")
+                await safe_telegram_call(self.bot.send_message, chat_id=admin_id, text=alert_text, parse_mode="HTML")
 
     async def run_daily_plan(self, target_date: Optional[str] = None) -> Tuple[bool, str, List[dict]]:
+        async with self._daily_plan_lock:
+            return await self._run_daily_plan(target_date)
+
+    async def _run_daily_plan(self, target_date: Optional[str] = None) -> Tuple[bool, str, List[dict]]:
         if target_date is None:
             now = datetime.now(self.timezone)
             date_str = now.strftime("%Y-%m-%d")
@@ -144,6 +148,16 @@ class SchedulerService:
         builder = TripBuilder()
         trips, warnings = builder.generate_trips_for_day(schedules, absences)
 
+        # K1: haydovchi biriktirilmagan reyslarga, faqat bitta faol haydovchi bo'lsa, unga biriktiriladi
+        active_drivers = [d for d in await self.db.get_drivers() if d["is_active"]]
+        fallback_driver = active_drivers[0]["id"] if len(active_drivers) == 1 else None
+        for t in trips:
+            if not t.get("driver_id"):
+                t["driver_id"] = fallback_driver
+        unassigned = [t for t in trips if not t.get("driver_id")]
+        if unassigned:
+            warnings.append(f"⚠️ {len(unassigned)} ta reysga haydovchi biriktirilmagan.")
+
         saved = await self.db.save_generated_trips(trips, date_str)
         if not saved:
             return False, "save_failed", []
@@ -153,17 +167,17 @@ class SchedulerService:
         if self.bot and trips:
             text = (
                 f"📋 <b>{date_str} kunlik reyslar rejasi shakllantirildi:</b>\n"
-                f"Jami reyslar soni: <b>{len(trips)} ta</b>.\n\n"
-                f"Rejalarni ko'rib chiqib tasdiqlang:"
+                f"Jami reyslar soni: <b>{len(trips)} ta</b>.\n"
+                + ("\n".join(warnings) + "\n" if warnings else "")
+                + "\nRejalarni ko'rib chiqib tasdiqlang:"
             )
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"admin_approve_trips:{date_str}")]
             ])
             for admin_id in settings.admin_ids_list:
-                try:
-                    await self.bot.send_message(chat_id=admin_id, text=text, reply_markup=kb, parse_mode="HTML")
-                except Exception as e:
-                    logger.error(f"Adminga kunlik reja yuborishda xatolik: {e}")
+                await safe_telegram_call(
+                    self.bot.send_message, chat_id=admin_id, text=text, reply_markup=kb, parse_mode="HTML"
+                )
 
         return True, "success", trips
 
@@ -183,10 +197,7 @@ class SchedulerService:
         if self.bot and count > 0:
             msg = f"⏰ <b>{date_str}</b> sanasi uchun reyslar avtomatik tasdiqlandi ({count} ta)."
             for admin_id in settings.admin_ids_list:
-                try:
-                    await self.bot.send_message(chat_id=admin_id, text=msg, parse_mode="HTML")
-                except Exception as e:
-                    logger.error(f"Adminga avto-tasdiq xabari yuborishda xatolik: {e}")
+                await safe_telegram_call(self.bot.send_message, chat_id=admin_id, text=msg, parse_mode="HTML")
 
         return count
 
@@ -199,7 +210,7 @@ class SchedulerService:
             return 0
 
         days = retention_days if retention_days is not None else settings.BACKUP_RETENTION_DAYS
-        now_ts = datetime.now().timestamp()
+        now_ts = now_tashkent().timestamp()
         cutoff_sec = days * 86400
         deleted_count = 0
 
@@ -227,7 +238,23 @@ class SchedulerService:
         dest = os.path.join(target_dir, f"damas_reys_{now_str}.db")
         source = db_path or getattr(self.db, "db_path", settings.get_db_path())
         if os.path.exists(source):
-            shutil.copy2(source, dest)
+            # K4: WAL-xavfsiz onlayn nusxa (sqlite3 backup API), so'ngra atomik almashtirish
+            import sqlite3
+            tmp = dest + ".tmp"
+            try:
+                src_conn = sqlite3.connect(source)
+                try:
+                    dst_conn = sqlite3.connect(tmp)
+                    try:
+                        src_conn.backup(dst_conn)
+                    finally:
+                        dst_conn.close()
+                finally:
+                    src_conn.close()
+                os.replace(tmp, dest)
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
             logger.info(f"Baza zaxiralandi: {dest}")
 
         # 7 kundan eski zaxiralarni tozalash
@@ -235,16 +262,23 @@ class SchedulerService:
         return dest
 
     def start(self):
-        # 06:30 Kunlik reja
+        plan_hour, plan_minute = map(int, settings.DAILY_PLAN_TIME.split(":"))
+        approve_hour, approve_minute = map(int, settings.AUTO_APPROVE_TIME.split(":"))
+        if not (0 <= plan_hour <= 23 and 0 <= plan_minute <= 59):
+            raise ValueError("DAILY_PLAN_TIME HH:MM formatida bo'lishi kerak")
+        if not (0 <= approve_hour <= 23 and 0 <= approve_minute <= 59):
+            raise ValueError("AUTO_APPROVE_TIME HH:MM formatida bo'lishi kerak")
+
+        # Kunlik reja
         self.scheduler.add_job(
             self.run_daily_plan,
-            CronTrigger(hour=6, minute=30, timezone=self.timezone),
+            CronTrigger(hour=plan_hour, minute=plan_minute, timezone=self.timezone),
             id="daily_plan"
         )
-        # 07:00 Avto-tasdiq
+        # Avto-tasdiq
         self.scheduler.add_job(
             self.run_auto_approve,
-            CronTrigger(hour=7, minute=0, timezone=self.timezone),
+            CronTrigger(hour=approve_hour, minute=approve_minute, timezone=self.timezone),
             id="auto_approve"
         )
         # Har 1 daqiqada eslatmalar tekshiruvi

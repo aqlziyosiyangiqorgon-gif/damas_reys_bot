@@ -3,6 +3,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from models.enums import UserRole
 from database.db import Database
+from utils.text import escape_html
 
 common_router = Router()
 
@@ -21,7 +22,7 @@ def get_admin_menu_kb() -> ReplyKeyboardMarkup:
 async def cmd_start(message: types.Message, user_role: UserRole, db: Database):
     if user_role == UserRole.ADMIN:
         text = (
-            f"👑 <b>Assalomu alaykum, {message.from_user.first_name}!</b>\n"
+            f"👑 <b>Assalomu alaykum, {escape_html(message.from_user.first_name)}!</b>\n"
             f"<b>AQL ZIYOSI</b> transport tizimi <b>Admin boshqaruv paneliga</b> xush kelibsiz.\n\n"
             f"Quyidagi tugmalar yoki buyruqlar orqali tizimni boshqarishingiz mumkin:\n"
             f"• <b>/qoshish</b> — Yangi o'quvchi qo'shish\n"
@@ -39,7 +40,7 @@ async def cmd_start(message: types.Message, user_role: UserRole, db: Database):
     elif user_role == UserRole.DRIVER:
         from handlers.driver import get_driver_menu_kb
         await message.answer(
-            f"🚐 <b>Assalomu alaykum, {message.from_user.first_name}!</b>\n"
+            f"🚐 <b>Assalomu alaykum, {escape_html(message.from_user.first_name)}!</b>\n"
             f"Siz tizimda <b>Haydovchi</b> sifatida ro'yxatdansiz.\n\n"
             f"Reyslaringizni ko'rish yoki markaz bilan bog'lanish uchun pastdagi menyudan foydalaning:",
             reply_markup=get_driver_menu_kb(),
@@ -48,10 +49,13 @@ async def cmd_start(message: types.Message, user_role: UserRole, db: Database):
         return
 
     elif user_role == UserRole.STAFF:
+        from handlers.staff import get_staff_menu_kb
         await message.answer(
-            f"🏫 <b>Assalomu alaykum, {message.from_user.first_name}!</b>\n"
+            f"🏫 <b>Assalomu alaykum, {escape_html(message.from_user.first_name)}!</b>\n"
             f"Siz tizimda <b>Xodim</b> sifatida ro'yxatdansiz.\n\n"
-            f"Markazga kelgan reyslarni qabul qilish: <b>/qabul</b> yoki <b>/markaz</b>",
+            f"Bugungi kelish va uyga topshirish reyslarini pastdagi tugmalardan oching.\n"
+            f"Buyruqlar: <b>/qabul</b>, <b>/markaz</b>, <b>/topshirish</b>",
+            reply_markup=get_staff_menu_kb(),
             parse_mode="HTML"
         )
         return

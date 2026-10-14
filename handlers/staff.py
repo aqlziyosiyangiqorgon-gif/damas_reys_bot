@@ -1,14 +1,32 @@
+from utils.time import now_tashkent
 from datetime import datetime
 from typing import Optional
 from aiogram import Router, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
 from database.db import Database
 from models.enums import UserRole, TripStatus, TripItemStatus
 from services.notify_service import NotifyService
+from utils.text import escape_html
 
 staff_router = Router()
+
+
+def get_staff_menu_kb() -> ReplyKeyboardMarkup:
+    """Markaz xodimlari uchun doimiy kabinet menyusi."""
+    builder = ReplyKeyboardBuilder()
+    builder.row(
+        KeyboardButton(text="🏫 Bugungi kelish reyslari"),
+        KeyboardButton(text="🏠 Bugungi topshirish reyslari"),
+    )
+    return builder.as_markup(resize_keyboard=True)
 
 def build_staff_center_keyboard(trip: dict) -> InlineKeyboardMarkup:
     rows = []
@@ -71,13 +89,13 @@ def format_staff_trip_card(trip: dict, is_center: bool = True) -> str:
         TripStatus.HANDED_OVER.value: "Topshirilgan",
         TripStatus.DONE.value: "Yakunlangan"
     }
-    st_text = status_map.get(trip["status"], trip["status"])
+    st_text = escape_html(status_map.get(trip["status"], trip["status"]))
     title = "Markazga kelish" if is_center else "Uyga qaytish"
     driver_info = trip.get("driver_name") or "Biriktirilmagan"
 
     text = (
         f"🏫 <b>Reys #{trip['id']}</b> ({title})\n"
-        f"🚗 Haydovchi: <b>{driver_info}</b>\n"
+        f"🚗 Haydovchi: <b>{escape_html(driver_info)}</b>\n"
         f"📅 Sana: <b>{trip['date']}</b> | Vaqt: <b>{trip['planned_time']}</b>\n"
         f"📌 Holat: <b>{st_text}</b>\n"
         f"👥 O'quvchilar ro'yxati ({len(trip.get('items', []))} nafar):\n"
@@ -91,13 +109,14 @@ def format_staff_trip_card(trip: dict, is_center: bool = True) -> str:
             ico = "🚫"
         else:
             ico = "⏳"
-        text += f"  {idx}. <b>{it['full_name']}</b> ({it['village_name']}) [{ico}]\n"
+        text += f"  {idx}. <b>{escape_html(it['full_name'])}</b> ({escape_html(it['village_name'])}) [{ico}]\n"
 
     return text
 
 # --- 1. /markaz va /qabul buyruqlari ---
 @staff_router.message(Command("markaz"))
 @staff_router.message(Command("qabul"))
+@staff_router.message(F.text == "🏫 Bugungi kelish reyslari")
 async def cmd_staff_center(message: types.Message, db: Database, user_role: UserRole):
     if user_role != UserRole.STAFF:
         await message.answer("Ushbu buyruq faqat markaz xodimlari uchun!")
@@ -108,14 +127,21 @@ async def cmd_staff_center(message: types.Message, db: Database, user_role: User
         await message.answer("Siz ro'yxatdan o'tgan faol xodim emassiz!")
         return
 
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = now_tashkent().strftime("%Y-%m-%d")
     trips = await db.get_active_to_center_trips_for_staff(date_str)
 
     if not trips:
-        await message.answer(f"Bugun ({date_str}) markazga yetib kelgan faol reyslar topilmadi.")
+        await message.answer(
+            f"Bugun ({date_str}) markazga yetib kelgan faol reyslar topilmadi.",
+            reply_markup=get_staff_menu_kb(),
+        )
         return
 
-    await message.answer(f"🏫 <b>Markazga yetib kelgan reyslar ({date_str}):</b>", parse_mode="HTML")
+    await message.answer(
+        f"🏫 <b>Markazga yetib kelgan reyslar ({date_str}):</b>",
+        reply_markup=get_staff_menu_kb(),
+        parse_mode="HTML",
+    )
     for trip in trips:
         card = format_staff_trip_card(trip, is_center=True)
         kb = build_staff_center_keyboard(trip)
@@ -123,6 +149,7 @@ async def cmd_staff_center(message: types.Message, db: Database, user_role: User
 
 # --- 2. /topshirish buyrug'i ---
 @staff_router.message(Command("topshirish"))
+@staff_router.message(F.text == "🏠 Bugungi topshirish reyslari")
 async def cmd_staff_home(message: types.Message, db: Database, user_role: UserRole):
     if user_role != UserRole.STAFF:
         await message.answer("Ushbu buyruq faqat markaz xodimlari uchun!")
@@ -133,14 +160,21 @@ async def cmd_staff_home(message: types.Message, db: Database, user_role: UserRo
         await message.answer("Siz ro'yxatdan o'tgan faol xodim emassiz!")
         return
 
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = now_tashkent().strftime("%Y-%m-%d")
     trips = await db.get_active_to_home_trips_for_staff(date_str)
 
     if not trips:
-        await message.answer(f"Bugun ({date_str}) qaytish reyslari topilmadi.")
+        await message.answer(
+            f"Bugun ({date_str}) qaytish reyslari topilmadi.",
+            reply_markup=get_staff_menu_kb(),
+        )
         return
 
-    await message.answer(f"🚗 <b>Qaytish reyslari ({date_str}):</b>", parse_mode="HTML")
+    await message.answer(
+        f"🚗 <b>Qaytish reyslari ({date_str}):</b>",
+        reply_markup=get_staff_menu_kb(),
+        parse_mode="HTML",
+    )
     for trip in trips:
         card = format_staff_trip_card(trip, is_center=False)
         kb = build_staff_home_keyboard(trip)
@@ -157,6 +191,11 @@ async def cb_staff_accept(callback: types.CallbackQuery, db: Database):
     parts = callback.data.split(":")
     trip_id = int(parts[1])
     item_id = int(parts[2])
+
+    target_item = await db.get_trip_item_by_id(item_id)
+    if not target_item or target_item["trip_id"] != trip_id:
+        await callback.answer("O'quvchi ushbu reysga tegishli emas!", show_alert=True)
+        return
 
     success, reason, item = await db.accept_student(item_id, staff["id"])
     if not success:
@@ -244,6 +283,11 @@ async def cb_staff_handover(callback: types.CallbackQuery, db: Database):
     parts = callback.data.split(":")
     trip_id = int(parts[1])
     item_id = int(parts[2])
+
+    target_item = await db.get_trip_item_by_id(item_id)
+    if not target_item or target_item["trip_id"] != trip_id:
+        await callback.answer("O'quvchi ushbu reysga tegishli emas!", show_alert=True)
+        return
 
     success, reason, item = await db.handover_student(item_id, staff["id"])
     if not success:

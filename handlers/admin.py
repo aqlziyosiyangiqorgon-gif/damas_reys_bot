@@ -1,3 +1,4 @@
+from utils.time import now_tashkent
 from datetime import datetime
 from typing import Optional, List
 from aiogram import Router, types, F
@@ -9,6 +10,8 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
 from config import settings
 from database.db import Database, normalize_phone
+from utils.text import escape_html
+from utils.telegram import safe_telegram_call
 
 admin_router = Router()
 
@@ -145,9 +148,9 @@ async def cmd_qishloqlar(message: types.Message, db: Database):
     for v in villages:
         if v["zone_name"] != current_zone:
             current_zone = v["zone_name"]
-            text += f"\n📍 <b>{current_zone}:</b>\n"
+            text += f"\n📍 <b>{escape_html(current_zone)}:</b>\n"
         pickup = f" (To'xtash: {v['pickup_point']})" if v.get("pickup_point") else ""
-        text += f"  {v['route_order']}. <b>{v['name']}</b> ({v.get('school_name', '-')}) — ⏱ {v['travel_minutes']} daq{pickup}\n"
+        text += f"  {v['route_order']}. <b>{escape_html(v['name'])}</b> ({escape_html(v.get('school_name', '-'))}) — ⏱ {v['travel_minutes']} daq{escape_html(pickup)}\n"
         rows.append([InlineKeyboardButton(text=f"✏️ {v['name']} ({v['zone_name']})", callback_data=f"edit_v:{v['id']}")])
 
     text += "\n<i>Tahrirlash uchun mahallani tanlang:</i>"
@@ -168,8 +171,8 @@ async def cb_edit_village_start(callback: types.CallbackQuery, state: FSMContext
     await state.update_data(editing_village_id=v_id, orig_village=village)
     await state.set_state(EditVillageStates.waiting_for_name)
     await callback.message.edit_text(
-        f"✏️ <b>{village['name']} ({village['zone_name']}) tahrirlash</b>\n\n"
-        f"1. Yangi mahalla nomini kiriting (hozirgi: <code>{village['name']}</code>):",
+        f"✏️ <b>{escape_html(village['name'])} ({escape_html(village['zone_name'])}) tahrirlash</b>\n\n"
+        f"1. Yangi mahalla nomini kiriting (hozirgi: <code>{escape_html(village['name'])}</code>):",
         parse_mode="HTML"
     )
     await callback.answer()
@@ -234,10 +237,10 @@ async def process_village_pickup(message: types.Message, state: FSMContext, db: 
     await state.clear()
     await message.answer(
         f"✅ <b>Mahalla muvaffaqiyatli yangilandi!</b>\n\n"
-        f"Nomi: <b>{data['new_name']}</b> ({data['school_name']})\n"
+        f"Nomi: <b>{escape_html(data['new_name'])}</b> ({escape_html(data['school_name'])})\n"
         f"Yo'l vaqti: <b>{data['travel_minutes']} daqiqa</b>\n"
         f"Tartibi: <b>{data['route_order']}</b>\n"
-        f"To'planish nuqtasi: <b>{pickup_point}</b>\n\n"
+        f"To'planish nuqtasi: <b>{escape_html(pickup_point)}</b>\n\n"
         f"Ko'rish: /qishloqlar",
         parse_mode="HTML"
     )
@@ -261,7 +264,7 @@ async def cmd_haydovchilar(message: types.Message, db: Database):
     else:
         for d in drivers:
             status_ico = "✅ Faol" if d["is_active"] else "❌ Nofaol"
-            text += f"• <b>{d['full_name']}</b> — 📞 {d['phone']} | TG: <code>{d['telegram_id']}</code> [{status_ico}]\n"
+            text += f"• <b>{escape_html(d['full_name'])}</b> — 📞 {escape_html(d['phone'])} | TG: <code>{d['telegram_id']}</code> [{status_ico}]\n"
             btn_text = f"🛑 Nofaol qilish" if d["is_active"] else f"🟢 Faollashtirish"
             new_status = 0 if d["is_active"] else 1
             rows.append([InlineKeyboardButton(text=f"{btn_text}: {d['full_name']}", callback_data=f"toggle_driver:{d['id']}:{new_status}")])
@@ -283,7 +286,7 @@ async def cb_toggle_driver(callback: types.CallbackQuery, db: Database):
     rows = []
     for d in drivers:
         status_ico = "✅ Faol" if d["is_active"] else "❌ Nofaol"
-        text += f"• <b>{d['full_name']}</b> — 📞 {d['phone']} | TG: <code>{d['telegram_id']}</code> [{status_ico}]\n"
+        text += f"• <b>{escape_html(d['full_name'])}</b> — 📞 {escape_html(d['phone'])} | TG: <code>{d['telegram_id']}</code> [{status_ico}]\n"
         btn_text = f"🛑 Nofaol qilish" if d["is_active"] else f"🟢 Faollashtirish"
         nxt = 0 if d["is_active"] else 1
         rows.append([InlineKeyboardButton(text=f"{btn_text}: {d['full_name']}", callback_data=f"toggle_driver:{d['id']}:{nxt}")])
@@ -336,8 +339,8 @@ async def process_driver_phone(message: types.Message, state: FSMContext, db: Da
     await state.clear()
     await message.answer(
         f"✅ <b>Haydovchi muvaffaqiyatli qo'shildi!</b>\n\n"
-        f"ID: {driver_id} | Ismi: <b>{data['full_name']}</b>\n"
-        f"Telefon: <b>{norm}</b> | TG ID: <code>{data['tg_id']}</code>\n\n"
+        f"ID: {driver_id} | Ismi: <b>{escape_html(data['full_name'])}</b>\n"
+        f"Telefon: <b>{escape_html(norm)}</b> | TG ID: <code>{data['tg_id']}</code>\n\n"
         f"Ro'yxat: /haydovchilar",
         parse_mode="HTML"
     )
@@ -362,7 +365,7 @@ async def cmd_xodimlar(message: types.Message, db: Database):
         for s in staff_list:
             status_ico = "✅ Faol" if s["is_active"] else "❌ Nofaol"
             phone_str = f" | 📞 {s['phone']}" if s.get("phone") else ""
-            text += f"• <b>{s['full_name']}</b>{phone_str} | TG: <code>{s['telegram_id']}</code> [{status_ico}]\n"
+            text += f"• <b>{escape_html(s['full_name'])}</b>{escape_html(phone_str)} | TG: <code>{s['telegram_id']}</code> [{status_ico}]\n"
             btn_text = f"🛑 Nofaol qilish" if s["is_active"] else f"🟢 Faollashtirish"
             nxt = 0 if s["is_active"] else 1
             rows.append([InlineKeyboardButton(text=f"{btn_text}: {s['full_name']}", callback_data=f"toggle_staff:{s['id']}:{nxt}")])
@@ -385,7 +388,7 @@ async def cb_toggle_staff(callback: types.CallbackQuery, db: Database):
     for s in staff_list:
         status_ico = "✅ Faol" if s["is_active"] else "❌ Nofaol"
         phone_str = f" | 📞 {s['phone']}" if s.get("phone") else ""
-        text += f"• <b>{s['full_name']}</b>{phone_str} | TG: <code>{s['telegram_id']}</code> [{status_ico}]\n"
+        text += f"• <b>{escape_html(s['full_name'])}</b>{escape_html(phone_str)} | TG: <code>{s['telegram_id']}</code> [{status_ico}]\n"
         btn_text = f"🛑 Nofaol qilish" if s["is_active"] else f"🟢 Faollashtirish"
         nxt = 0 if s["is_active"] else 1
         rows.append([InlineKeyboardButton(text=f"{btn_text}: {s['full_name']}", callback_data=f"toggle_staff:{s['id']}:{nxt}")])
@@ -440,8 +443,8 @@ async def process_staff_phone(message: types.Message, state: FSMContext, db: Dat
     await state.clear()
     await message.answer(
         f"✅ <b>Xodim muvaffaqiyatli qo'shildi!</b>\n\n"
-        f"ID: {staff_id} | Ismi: <b>{data['full_name']}</b>\n"
-        f"Telefon: <b>{norm or 'Kiritilmagan'}</b> | TG ID: <code>{data['tg_id']}</code>\n\n"
+        f"ID: {staff_id} | Ismi: <b>{escape_html(data['full_name'])}</b>\n"
+        f"Telefon: <b>{escape_html(norm or 'Kiritilmagan')}</b> | TG ID: <code>{data['tg_id']}</code>\n\n"
         f"Ro'yxat: /xodimlar",
         parse_mode="HTML"
     )
@@ -481,7 +484,7 @@ async def process_student_village(callback: types.CallbackQuery, state: FSMConte
     await state.update_data(village_id=village_id, village_name=village["name"] if village else "")
     await state.set_state(AddStudentStates.waiting_for_phone_1)
     await callback.message.edit_text(
-        f"Tanlandi: <b>{village['name'] if village else ''}</b>\n\n"
+        f"Tanlandi: <b>{escape_html(village['name'] if village else '')}</b>\n\n"
         "3. <b>Asosiy ota-ona telefon raqami</b>ni kiriting (masalan: <code>90 123 45 67</code> yoki <code>+998901234567</code>):",
         parse_mode="HTML"
     )
@@ -555,7 +558,7 @@ async def process_student_days(callback: types.CallbackQuery, state: FSMContext)
     await state.update_data(selected_days=days, days_label=label)
     await state.set_state(AddStudentStates.waiting_for_time)
     await callback.message.edit_text(
-        f"Kunlar: <b>{label}</b>\n\n"
+        f"Kunlar: <b>{escape_html(label)}</b>\n\n"
         "6. Dars vaqtini kiriting (Boshlanish va Tugash vaqti, masalan: <code>09:00-11:00</code> yoki <code>14:00-16:00</code>):",
         parse_mode="HTML"
     )
@@ -594,11 +597,11 @@ async def process_student_time(message: types.Message, state: FSMContext, db: Da
     phone2_str = f"\n2-Telefon: {data.get('parent_phone_2')}" if data.get("parent_phone_2") else ""
     await message.answer(
         f"✅ <b>O'quvchi muvaffaqiyatli saqlandi!</b>\n\n"
-        f"👤 F.I.Sh: <b>{data['full_name']}</b>\n"
-        f"🏘 Mahalla: <b>{data.get('village_name', '')}</b>\n"
-        f"📞 Asosiy telefon: <b>{data['parent_phone_1']}</b>{phone2_str}\n"
-        f"📅 Kunlar: <b>{data.get('days_label', '')}</b>\n"
-        f"⏱ Dars vaqti: <b>{start_time} - {end_time}</b>",
+        f"👤 F.I.Sh: <b>{escape_html(data['full_name'])}</b>\n"
+        f"🏘 Mahalla: <b>{escape_html(data.get('village_name', ''))}</b>\n"
+        f"📞 Asosiy telefon: <b>{escape_html(data['parent_phone_1'])}</b>{escape_html(phone2_str)}\n"
+        f"📅 Kunlar: <b>{escape_html(data.get('days_label', ''))}</b>\n"
+        f"⏱ Dars vaqti: <b>{escape_html(start_time)} - {escape_html(end_time)}</b>",
         parse_mode="HTML"
     )
 
@@ -653,9 +656,9 @@ async def cb_select_student_to_edit(callback: types.CallbackQuery, state: FSMCon
     ])
     p2 = f" | 2: {student['parent_phone_2']}" if student.get("parent_phone_2") else ""
     await callback.message.edit_text(
-        f"Tanlandi: <b>{student['full_name']}</b>\n"
-        f"Mahalla: <b>{student['village_name']}</b>\n"
-        f"Telefon: <b>{student['parent_phone_1']}</b>{p2}\n\n"
+        f"Tanlandi: <b>{escape_html(student['full_name'])}</b>\n"
+        f"Mahalla: <b>{escape_html(student['village_name'])}</b>\n"
+        f"Telefon: <b>{escape_html(student['parent_phone_1'])}</b>{escape_html(p2)}\n\n"
         f"Qaysi ma'lumotni o'zgartirmoqchisiz?",
         reply_markup=kb,
         parse_mode="HTML"
@@ -680,7 +683,7 @@ async def process_new_student_name(message: types.Message, state: FSMContext, db
     st = data["student_data"]
     await db.update_student(st["id"], new_name, st["village_id"], st["parent_phone_1"], st["parent_phone_2"])
     await state.clear()
-    await message.answer(f"✅ O'quvchi ismi yangilandi: <b>{new_name}</b>", parse_mode="HTML")
+    await message.answer(f"✅ O'quvchi ismi yangilandi: <b>{escape_html(new_name)}</b>", parse_mode="HTML")
 
 @admin_router.callback_query(EditStudentStates.selecting_field, F.data == "field_village")
 async def cb_edit_field_village(callback: types.CallbackQuery, state: FSMContext, db: Database):
@@ -707,7 +710,7 @@ async def process_new_student_village(callback: types.CallbackQuery, state: FSMC
     await db.update_student(st["id"], st["full_name"], new_v_id, st["parent_phone_1"], st["parent_phone_2"])
     v = await db.get_village_by_id(new_v_id)
     await state.clear()
-    await callback.message.edit_text(f"✅ O'quvchi mahallasi yangilandi: <b>{v['name'] if v else ''}</b>", parse_mode="HTML")
+    await callback.message.edit_text(f"✅ O'quvchi mahallasi yangilandi: <b>{escape_html(v['name'] if v else '')}</b>", parse_mode="HTML")
     await callback.answer()
 
 @admin_router.callback_query(EditStudentStates.selecting_field, F.data == "field_phone")
@@ -731,7 +734,7 @@ async def process_new_phone1(message: types.Message, state: FSMContext, db: Data
     st = data["student_data"]
     await db.update_student(st["id"], st["full_name"], st["village_id"], norm, st["parent_phone_2"])
     await state.clear()
-    await message.answer(f"✅ O'quvchi asosiy telefoni yangilandi: <b>{norm}</b>", parse_mode="HTML")
+    await message.answer(f"✅ O'quvchi asosiy telefoni yangilandi: <b>{escape_html(norm)}</b>", parse_mode="HTML")
 
 # ============================================================================
 # 6. /ochirish — O'quvchini tizimdan nofaol qilish (o'chirish)
@@ -780,7 +783,7 @@ async def cb_confirm_delete_student(callback: types.CallbackQuery, state: FSMCon
         [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin_cancel")]
     ])
     await callback.message.edit_text(
-        f"Haqiqatan ham <b>{student['full_name']}</b> ({student['village_name']}) ni tizimdan o'chirmoqchimisiz?\n\n"
+        f"Haqiqatan ham <b>{escape_html(student['full_name'])}</b> ({escape_html(student['village_name'])}) ni tizimdan o'chirmoqchimisiz?\n\n"
         "<i>(O'quvchi nofaol qilinadi va yangi reyslarga qo'shilmaydi)</i>",
         reply_markup=kb,
         parse_mode="HTML"
@@ -842,7 +845,7 @@ async def cb_show_student_schedule(callback: types.CallbackQuery, state: FSMCont
     schedules = await db.get_student_schedules(student_id)
     await state.update_data(schedule_student_id=student_id, student_name=student["full_name"])
 
-    text = f"📅 <b>{student['full_name']}</b> dars jadvali:\n\n"
+    text = f"📅 <b>{escape_html(student['full_name'])}</b> dars jadvali:\n\n"
     rows = []
 
     sch_dict = {s["weekday"]: f"{s['start_time']} - {s['end_time']}" for s in schedules}
@@ -869,7 +872,7 @@ async def cb_select_schedule_day(callback: types.CallbackQuery, state: FSMContex
     await state.update_data(edit_weekday=weekday)
     await state.set_state(EditScheduleStates.waiting_for_new_time)
     await callback.message.edit_text(
-        f"📅 <b>{day_name}</b> kuni uchun yangi vaqtni kiriting:\n\n"
+        f"📅 <b>{escape_html(day_name)}</b> kuni uchun yangi vaqtni kiriting:\n\n"
         f"Format: <code>09:00-11:00</code> yoki <code>14:00-16:00</code>:",
         parse_mode="HTML"
     )
@@ -901,8 +904,8 @@ async def process_save_schedule_time(message: types.Message, state: FSMContext, 
     await db.update_student_schedule_time(student_id, weekday, start_time, end_time)
     await state.clear()
     await message.answer(
-        f"✅ <b>{data.get('student_name', '')}</b> ning <b>{day_name}</b> kungi darsi yangilandi:\n"
-        f"⏱ <b>{start_time} - {end_time}</b>\n\n"
+        f"✅ <b>{escape_html(data.get('student_name', ''))}</b> ning <b>{escape_html(day_name)}</b> kungi darsi yangilandi:\n"
+        f"⏱ <b>{escape_html(start_time)} - {escape_html(end_time)}</b>\n\n"
         f"Jadvalni ko'rish: /jadval",
         parse_mode="HTML"
     )
@@ -955,31 +958,36 @@ async def process_admin_excel_upload(message: types.Message, db: Database):
     if not is_admin(message.from_user.id):
         return
     doc = message.document
-    if not doc.file_name or not doc.file_name.endswith(".xlsx"):
+    if not doc.file_name or not doc.file_name.lower().endswith(".xlsx"):
+        return
+    if getattr(doc, "file_size", None) is not None and doc.file_size > 10 * 1024 * 1024:
+        await message.answer("Excel fayl hajmi 10 MB dan oshmasligi kerak.")
         return
 
     import os
+    import tempfile
     import uuid
     from services.excel_service import ExcelService
 
-    temp_path = f"temp_{uuid.uuid4().hex[:8]}_{doc.file_name}"
-    await message.bot.download(doc, destination=temp_path)
-
+    with tempfile.NamedTemporaryFile(prefix="damas_excel_", suffix=".xlsx", delete=False) as temp_file:
+        temp_path = temp_file.name
     try:
+        await message.bot.download(doc, destination=temp_path)
         preview = await ExcelService.parse_and_preview_excel(temp_path, db)
         batch_id = uuid.uuid4().hex[:8]
         PENDING_EXCEL_IMPORTS[batch_id] = preview["valid_records"]
+        await db.save_workflow_payload(batch_id, message.from_user.id, "excel", preview["valid_records"])
 
         err_text = ""
         if preview["errors"]:
             err_text = "\n⚠️ <b>Xatolik bor qatorlar (saqlanmaydi):</b>\n"
             for err in preview["errors"][:5]:
-                err_text += f"  • {err['row']}-qator ({err['full_name']}): {err['error']}\n"
+                err_text += f"  • {err['row']}-qator ({escape_html(err['full_name'])}): {escape_html(err['error'])}\n"
             if len(preview["errors"]) > 5:
                 err_text += f"  <i>... va yana {len(preview['errors']) - 5} ta xato.</i>\n"
 
         text = (
-            f"📊 <b>Fayl tahlili ({doc.file_name}):</b>\n\n"
+            f"📊 <b>Fayl tahlili ({escape_html(doc.file_name)}):</b>\n\n"
             f"➕ Yangi o'quvchilar: <b>{preview['new_count']} ta</b>\n"
             f"🔄 Yangilanadiganlar: <b>{preview['update_count']} ta</b>\n"
             f"❌ Xatolik bor qatorlar: <b>{preview['error_count']} ta</b>\n"
@@ -1004,7 +1012,10 @@ async def cb_excel_save(callback: types.CallbackQuery, db: Database):
         await callback.answer("Ruxsat yo'q!", show_alert=True)
         return
     batch_id = callback.data.split(":")[1]
-    records = PENDING_EXCEL_IMPORTS.pop(batch_id, None)
+    cached_records = PENDING_EXCEL_IMPORTS.pop(batch_id, None)
+    records = await db.take_workflow_payload(batch_id, callback.from_user.id, "excel")
+    if records is None:
+        records = cached_records
     if not records:
         await callback.answer("Ma'lumotlar eskirgan yoki topilmadi!", show_alert=True)
         return
@@ -1019,12 +1030,14 @@ async def cb_excel_save(callback: types.CallbackQuery, db: Database):
     await callback.answer("Saqlandi!")
 
 @admin_router.callback_query(F.data.startswith("excel_cancel:"))
-async def cb_excel_cancel(callback: types.CallbackQuery):
+async def cb_excel_cancel(callback: types.CallbackQuery, db: Optional[Database] = None):
     if not is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q!", show_alert=True)
         return
     batch_id = callback.data.split(":")[1]
     PENDING_EXCEL_IMPORTS.pop(batch_id, None)
+    if db:
+        await db.delete_workflow_payload(batch_id, callback.from_user.id)
     await callback.message.edit_text("❌ Excel import bekor qilindi.")
     await callback.answer("Bekor qilindi.")
 
@@ -1145,14 +1158,12 @@ async def cb_admin_delay_apply(callback: types.CallbackQuery, db: Database):
 
     # 1. Haydovchiga xabar
     if delay_data.get("driver_tg_id") and callback.bot:
-        try:
-            await callback.bot.send_message(
-                chat_id=delay_data["driver_tg_id"],
-                text=f"⚠️ Admin reysni {minutes} daqiqaga kechiktirdi. Yangi rejalashtirilgan vaqt: <b>{delay_data['new_planned_time']}</b>",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
+        await safe_telegram_call(
+            callback.bot.send_message,
+            chat_id=delay_data["driver_tg_id"],
+            text=f"⚠️ Admin reysni {minutes} daqiqaga kechiktirdi. Yangi rejalashtirilgan vaqt: <b>{escape_html(delay_data['new_planned_time'])}</b>",
+            parse_mode="HTML",
+        )
 
     # 2. Ota-onalarga xabar (bola olingan va olinmaganiga qarab)
     for it in delay_data.get("items", []):
@@ -1163,11 +1174,13 @@ async def cb_admin_delay_apply(callback: types.CallbackQuery, db: Database):
 
         for p in it.get("parents", []):
             if callback.bot and p.get("telegram_id"):
-                try:
-                    await callback.bot.send_message(chat_id=p["telegram_id"], text=parent_msg)
-                except Exception:
-                    pass
-            await db.log_notification(parent_id=p["parent_id"], student_id=it["student_id"], text=parent_msg, status="sent")
+                sent_ok = await safe_telegram_call(callback.bot.send_message, chat_id=p["telegram_id"], text=parent_msg)
+            else:
+                sent_ok = False
+            await db.log_notification(
+                parent_id=p["parent_id"], student_id=it["student_id"], text=parent_msg,
+                status="sent" if sent_ok else "failed",
+            )
 
     await callback.message.edit_text(
         f"✅ <b>Reys #{trip_id}</b> muvaffaqiyatli {minutes} daqiqaga kechiktirildi!\n"
@@ -1296,6 +1309,7 @@ async def process_broadcast_content(message: types.Message, state: FSMContext, d
         "text": text,
         "media_id": media_id
     }
+    await db.save_workflow_payload(batch_id, message.from_user.id, "broadcast", PENDING_BROADCASTS[batch_id])
     await state.clear()
 
     preview_text = (
@@ -1322,7 +1336,10 @@ async def cb_broadcast_send(callback: types.CallbackQuery, db: Database):
 
     import asyncio
     batch_id = callback.data.split(":")[1]
-    bc_data = PENDING_BROADCASTS.pop(batch_id, None)
+    cached_data = PENDING_BROADCASTS.pop(batch_id, None)
+    bc_data = await db.take_workflow_payload(batch_id, callback.from_user.id, "broadcast")
+    if bc_data is None:
+        bc_data = cached_data
     if not bc_data:
         await callback.answer("Xabar eskirgan yoki topilmadi!", show_alert=True)
         return
@@ -1342,10 +1359,13 @@ async def cb_broadcast_send(callback: types.CallbackQuery, db: Database):
             continue
         try:
             if media_id:
-                await callback.bot.send_photo(chat_id=tg_id, photo=media_id, caption=text, parse_mode="HTML")
+                delivered = await safe_telegram_call(callback.bot.send_photo, chat_id=tg_id, photo=media_id, caption=text, parse_mode="HTML")
             else:
-                await callback.bot.send_message(chat_id=tg_id, text=text, parse_mode="HTML")
-            sent += 1
+                delivered = await safe_telegram_call(callback.bot.send_message, chat_id=tg_id, text=text, parse_mode="HTML")
+            if delivered:
+                sent += 1
+            else:
+                failed += 1
         except Exception:
             failed += 1
         await asyncio.sleep(0.05)
@@ -1372,11 +1392,16 @@ async def cb_broadcast_send(callback: types.CallbackQuery, db: Database):
 
 @admin_router.callback_query(F.data == "bc_cancel")
 @admin_router.callback_query(F.data.startswith("bc_cancel_batch:"))
-async def cb_broadcast_cancel(callback: types.CallbackQuery, state: FSMContext):
+async def cb_broadcast_cancel(callback: types.CallbackQuery, state: FSMContext, db: Optional[Database] = None):
     if not is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q!", show_alert=True)
         return
     await state.clear()
+    if callback.data.startswith("bc_cancel_batch:"):
+        batch_id = callback.data.split(":", 1)[1]
+        PENDING_BROADCASTS.pop(batch_id, None)
+        if db:
+            await db.delete_workflow_payload(batch_id, callback.from_user.id)
     await callback.message.edit_text("❌ Xabar yuborish bekor qilindi.")
     await callback.answer("Bekor qilindi.")
 
@@ -1388,7 +1413,7 @@ async def cb_broadcast_cancel(callback: types.CallbackQuery, state: FSMContext):
 async def admin_today_trips_menu(message: types.Message, db: Database):
     if not is_admin(message.from_user.id):
         return
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = now_tashkent().strftime("%Y-%m-%d")
     trips = await db.get_trips_by_date(today_str)
     unapproved = await db.get_unapproved_trips(today_str)
 
@@ -1419,10 +1444,10 @@ async def admin_today_trips_menu(message: types.Message, db: Database):
 
         card_text = (
             f"📋 <b>Reys #{t['id']} — {dir_label}</b>\n"
-            f"⏰ Reja vaqti: <b>{t['planned_time']}</b>\n"
-            f"🚗 Haydovchi: <b>{driver_str}</b>\n"
+            f"⏰ Reja vaqti: <b>{escape_html(t['planned_time'])}</b>\n"
+            f"🚗 Haydovchi: <b>{escape_html(driver_str)}</b>\n"
             f"👥 O'quvchilar: <b>{items_cnt} ta</b>\n"
-            f"🚦 Holati: <b>{st_label}</b> ({approved_ico})"
+            f"🚦 Holati: <b>{escape_html(st_label)}</b> ({approved_ico})"
         )
 
         rows = [
@@ -1438,11 +1463,11 @@ async def admin_today_trips_menu(message: types.Message, db: Database):
 async def admin_statistics_menu(message: types.Message, db: Database):
     if not is_admin(message.from_user.id):
         return
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = now_tashkent().strftime("%Y-%m-%d")
     stats = await db.get_daily_transport_stats(today_str)
 
     text = (
-        f"📊 <b>Bugungi transport hisoboti ({stats['date']}):</b>\n\n"
+        f"📊 <b>Bugungi transport hisoboti ({escape_html(stats['date'])}):</b>\n\n"
         f"🚐 <b>Jami reyslar:</b> {stats['total_trips']} ta\n"
         f"  • 🚖 Markazga kelish: <b>{stats['to_center_trips']} ta</b>\n"
         f"  • 🏠 Uyga qaytish: <b>{stats['to_home_trips']} ta</b>\n\n"
@@ -1574,7 +1599,7 @@ async def cb_admin_nav(callback: types.CallbackQuery, db: Database):
 async def admin_today_absences(message: types.Message, db: Database):
     if not is_admin(message.from_user.id):
         return
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = now_tashkent().strftime("%Y-%m-%d")
     absences = await db.get_today_absences_detailed(today_str)
 
     if not absences:
@@ -1593,8 +1618,8 @@ async def admin_today_absences(message: types.Message, db: Database):
         reported_by = a.get("reported_by_role") or "Noma'lum"
         phone = a.get("parent_phone") or "-"
         text += (
-            f"{idx}. <b>{a['student_name']}</b> ({v_name})\n"
-            f"   • Sabab: <i>{reason}</i>\n"
+            f"{idx}. <b>{escape_html(a['student_name'])}</b> ({escape_html(v_name)})\n"
+            f"   • Sabab: <i>{escape_html(reason)}</i>\n"
             f"   • Bildiruvchi: <b>{reported_by.capitalize()}</b> (Tel: {phone})\n\n"
         )
 

@@ -1,3 +1,4 @@
+from utils.time import now_tashkent
 import logging
 from datetime import datetime
 from aiogram import Router, types, F
@@ -9,6 +10,8 @@ from config import settings
 from database.db import Database
 from models.enums import UserRole, TripDirection, TripStatus, TripItemStatus
 from services.notify_service import NotifyService
+from utils.text import escape_html
+from utils.telegram import safe_telegram_call
 
 logger = logging.getLogger(__name__)
 driver_router = Router()
@@ -132,7 +135,7 @@ def format_trip_card_text(trip: dict) -> str:
         TripStatus.DONE.value: "Yakunlangan 🎉",
         TripStatus.CANCELLED.value: "Bekor qilingan ❌"
     }
-    status_label = status_dict.get(trip["status"], trip["status"])
+    status_label = escape_html(status_dict.get(trip["status"], trip["status"]))
 
     text = (
         f"📋 <b>Reys #{trip['id']} — {dir_label}</b>\n"
@@ -149,8 +152,8 @@ def format_trip_card_text(trip: dict) -> str:
             st_ico = "🏠 Yetkazilgan"
         elif it["status"] == TripItemStatus.ABSENT.value:
             st_ico = "🚫 Kelmaydi"
-        pickup = f" ({it['pickup_point']})" if it.get("pickup_point") else ""
-        text += f"  {idx}. <b>{it['full_name']}</b> — {it['village_name']}{pickup} [{st_ico}]\n"
+        pickup = f" ({escape_html(it['pickup_point'])})" if it.get("pickup_point") else ""
+        text += f"  {idx}. <b>{escape_html(it['full_name'])}</b> — {escape_html(it['village_name'])}{pickup} [{st_ico}]\n"
 
     return text
 
@@ -168,7 +171,7 @@ async def cmd_driver_trips(message: types.Message, db: Database, user_role: User
         await message.answer("Siz ro'yxatdan o'tgan faol haydovchi emassiz!")
         return
 
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = now_tashkent().strftime("%Y-%m-%d")
     trips = await db.get_driver_today_trips(driver["id"], date_str)
 
     if not trips:
@@ -233,7 +236,7 @@ async def cb_driver_alert(callback: types.CallbackQuery, db: Database):
     }
     sabab_matni = reason_map.get(action_type, action_type)
 
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = now_tashkent().strftime("%Y-%m-%d")
     trips = await db.get_driver_today_trips(driver["id"], date_str)
     active_trip = None
     for t in trips:
@@ -258,9 +261,9 @@ async def cb_driver_alert(callback: types.CallbackQuery, db: Database):
 
     alert_text = (
         "🚨 <b>TEZKOR OGOHLANTIRISH!</b>\n\n"
-        f"Haydovchi: <b>{driver['full_name']}</b> (Tel: <b>{driver['phone']}</b>)\n"
-        f"Sabab: <b>{sabab_matni}</b>\n"
-        f"Reys: <b>{trip_info}</b>\n\n"
+        f"Haydovchi: <b>{escape_html(driver['full_name'])}</b> (Tel: <b>{escape_html(driver['phone'])}</b>)\n"
+        f"Sabab: <b>{escape_html(sabab_matni)}</b>\n"
+        f"Reys: <b>{escape_html(trip_info)}</b>\n\n"
         "<i>Iltimos, zudlik bilan chora ko'ring yoki reysni kechiktiring!</i>"
     )
 
@@ -272,25 +275,16 @@ async def cb_driver_alert(callback: types.CallbackQuery, db: Database):
     )
 
     for admin_id in settings.admin_ids_list:
-        try:
-            await callback.bot.send_message(chat_id=admin_id, text=alert_text, parse_mode="HTML")
-        except Exception as e:
-            logger.warning(f"Admin {admin_id} ga tezkor signal yetib bormadi: {e}")
+        await safe_telegram_call(callback.bot.send_message, chat_id=admin_id, text=alert_text, parse_mode="HTML")
 
-    try:
-        staff_list = await db.get_all_staff()
-        for s in staff_list:
-            if s.get("telegram_id") and s.get("is_active"):
-                try:
-                    await callback.bot.send_message(chat_id=s["telegram_id"], text=alert_text, parse_mode="HTML")
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    staff_list = await db.get_all_staff()
+    for s in staff_list:
+        if s.get("telegram_id") and s.get("is_active"):
+            await safe_telegram_call(callback.bot.send_message, chat_id=s["telegram_id"], text=alert_text, parse_mode="HTML")
 
     await callback.message.edit_text(
         f"✅ <b>Ogohlantirish muvaffaqiyatli yuborildi!</b>\n\n"
-        f"Holat: <b>{sabab_matni}</b>\n"
+        f"Holat: <b>{escape_html(sabab_matni)}</b>\n"
         f"Adminlar va markaz xodimlariga xabar yetkazildi.",
         parse_mode="HTML"
     )
@@ -315,19 +309,26 @@ async def cb_driver_start_trip(callback: types.CallbackQuery, db: Database):
         await callback.answer("Bu sizning reysingiz emas!", show_alert=True)
         return
 
-    # Takroriy bosishdan himoya
     if trip["status"] == TripStatus.ON_WAY.value:
         await callback.answer("Reys allaqachon yo'lda!", show_alert=True)
         return
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    await db.update_trip_status(trip_id, TripStatus.ON_WAY.value, started_at=now_str)
-    await db.log_event(
-        actor_role="driver",
-        actor_id=callback.from_user.id,
-        action="start_trip",
-        trip_id=trip_id
+    now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
+    allowed_statuses = [TripStatus.PLANNED.value, TripStatus.APPROVED.value]
+    if trip["direction"] == TripDirection.TO_HOME.value:
+        allowed_statuses.append(TripStatus.HANDED_OVER.value)
+    claimed = await db.transition_trip(
+        trip_id,
+        allowed_statuses,
+        TripStatus.ON_WAY.value,
+        started_at=now_str,
+        direction=trip["direction"],
+        actor_tg_id=callback.from_user.id,
+        event_action="start_trip",
     )
+    if not claimed:
+        await callback.answer("Reys holati o'zgargan yoki harakatni boshlash mumkin emas.", show_alert=True)
+        return
 
     # Agar uyga qaytish (to_home) bo'lsa, ota-onalarga yo'lga chiqilgani bildiriladi
     if trip["direction"] == TripDirection.TO_HOME.value:
@@ -366,25 +367,32 @@ async def cb_driver_pickup(callback: types.CallbackQuery, db: Database):
         await callback.answer("Bu sizning reysingiz emas!", show_alert=True)
         return
 
+    if trip["status"] != TripStatus.ON_WAY.value:
+        await callback.answer("Reys hali yo'lga chiqmagan yoki holati o'zgargan!", show_alert=True)
+        return
+
     item = await db.get_trip_item_by_id(item_id)
     if not item:
         await callback.answer("O'quvchi ma'lumoti topilmadi!", show_alert=True)
         return
 
-    # Takroriy bosishdan himoya
+    if item["trip_id"] != trip_id or trip["direction"] != TripDirection.TO_CENTER.value:
+        await callback.answer("O'quvchi ushbu reysga tegishli emas!", show_alert=True)
+        return
     if item["status"] == TripItemStatus.PICKED_UP.value:
         await callback.answer("Ushbu bola allaqachon olingan!", show_alert=True)
         return
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    await db.update_trip_item_status(item_id, TripItemStatus.PICKED_UP.value, picked_at=now_str, actor_id=driver["id"])
-    await db.log_event(
-        actor_role="driver",
-        actor_id=callback.from_user.id,
-        action="pickup_student",
-        trip_id=trip_id,
-        student_id=item["student_id"]
+    now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
+    claimed = await db.claim_item(
+        item_id, trip_id, [TripItemStatus.PENDING.value], TripItemStatus.PICKED_UP.value,
+        "picked_at", now_str, driver["id"], trip_statuses=[TripStatus.ON_WAY.value],
+        direction=TripDirection.TO_CENTER.value, actor_tg_id=callback.from_user.id,
+        event_action="pickup_student",
     )
+    if not claimed:
+        await callback.answer("O'quvchi holati o'zgargan yoki uni olish mumkin emas.", show_alert=True)
+        return
 
     # Ota-onaga bildirishnoma
     notify_text = f"Farzandingiz mashinaga o'tirdi. Taxminan {item.get('travel_minutes', 15)} daqiqada markazga yetadi."
@@ -423,15 +431,23 @@ async def cb_driver_arrive_center(callback: types.CallbackQuery, db: Database):
     if trip["status"] == TripStatus.AT_CENTER.value:
         await callback.answer("Allaqachon markazga yetilgan!", show_alert=True)
         return
+    if trip["status"] != TripStatus.ON_WAY.value:
+        await callback.answer("Reys hali yo'lga chiqmagan yoki holati o'zgargan!", show_alert=True)
+        return
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    await db.update_trip_status(trip_id, TripStatus.AT_CENTER.value)
-    await db.log_event(
-        actor_role="driver",
-        actor_id=callback.from_user.id,
-        action="arrive_center",
-        trip_id=trip_id
+    if trip["direction"] != TripDirection.TO_CENTER.value:
+        await callback.answer("Bu markazga kelish reysi emas!", show_alert=True)
+        return
+
+    now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
+    claimed = await db.transition_trip(
+        trip_id, [TripStatus.ON_WAY.value], TripStatus.AT_CENTER.value,
+        direction=TripDirection.TO_CENTER.value, actor_tg_id=callback.from_user.id,
+        event_action="arrive_center",
     )
+    if not claimed:
+        await callback.answer("Reys holati o'zgargan yoki markazga yetib borish hali mumkin emas.", show_alert=True)
+        return
 
     # Ota-onaga bildirishnoma
     await NotifyService.notify_trip_students(
@@ -475,19 +491,25 @@ async def cb_driver_dropoff(callback: types.CallbackQuery, db: Database):
         await callback.answer("O'quvchi ma'lumoti topilmadi!", show_alert=True)
         return
 
+    if item["trip_id"] != trip_id or trip["direction"] != TripDirection.TO_HOME.value:
+        await callback.answer("O'quvchi ushbu reysga tegishli emas!", show_alert=True)
+        return
     if item["status"] == TripItemStatus.DROPPED_OFF.value:
         await callback.answer("Ushbu bola allaqachon yetkazilgan!", show_alert=True)
         return
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    await db.update_trip_item_status(item_id, TripItemStatus.DROPPED_OFF.value, dropped_at=now_str, actor_id=driver["id"])
-    await db.log_event(
-        actor_role="driver",
-        actor_id=callback.from_user.id,
-        action="dropoff_student",
-        trip_id=trip_id,
-        student_id=item["student_id"]
+    now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
+    claimed = await db.claim_item(
+        item_id, trip_id,
+        [TripItemStatus.PENDING.value, TripItemStatus.HANDED_OVER.value,
+         TripItemStatus.ARRIVED.value, TripItemStatus.ACCEPTED.value],
+        TripItemStatus.DROPPED_OFF.value, "dropped_at", now_str, driver["id"],
+        trip_statuses=[TripStatus.ON_WAY.value], direction=TripDirection.TO_HOME.value,
+        actor_tg_id=callback.from_user.id, event_action="dropoff_student",
     )
+    if not claimed:
+        await callback.answer("O'quvchi holati o'zgargan yoki uni yetkazish mumkin emas.", show_alert=True)
+        return
 
     # Ota-onaga bildirishnoma
     await NotifyService.send_student_notification(
@@ -522,18 +544,23 @@ async def cb_driver_finish_trip(callback: types.CallbackQuery, db: Database):
         await callback.answer("Bu sizning reysingiz emas!", show_alert=True)
         return
 
+    if trip["direction"] != TripDirection.TO_HOME.value:
+        await callback.answer("Reys turi uyga qaytish emas!", show_alert=True)
+        return
     if trip["status"] == TripStatus.DONE.value:
         await callback.answer("Reys allaqachon yakunlangan!", show_alert=True)
         return
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    await db.update_trip_status(trip_id, TripStatus.DONE.value, finished_at=now_str)
-    await db.log_event(
-        actor_role="driver",
-        actor_id=callback.from_user.id,
-        action="finish_trip",
-        trip_id=trip_id
+    now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
+    claimed = await db.transition_trip(
+        trip_id, [TripStatus.ON_WAY.value], TripStatus.DONE.value,
+        finished_at=now_str, direction=TripDirection.TO_HOME.value,
+        actor_tg_id=callback.from_user.id, event_action="finish_trip",
+        require_all_items_complete=True,
     )
+    if not claimed:
+        await callback.answer("Reys holati o'zgargan yoki yakunlash mumkin emas.", show_alert=True)
+        return
 
     updated_trip = await db.get_trip_details(trip_id)
     card_text = format_trip_card_text(updated_trip)

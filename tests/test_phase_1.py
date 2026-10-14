@@ -15,7 +15,7 @@ async def test_phase_1_full_verification():
         # 1. Toza baza yaratish
         await db.init_db()
 
-        # 2. Yangi bazada 14 ta jadval yaratilganini tekshirish
+        # 2. Yangi bazada amaliy va persistent state jadvallari yaratilganini tekshirish
         async with aiosqlite.connect(test_db) as conn:
             cur = await conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
             tables = [row[0] for row in await cur.fetchall()]
@@ -23,9 +23,9 @@ async def test_phase_1_full_verification():
         expected_tables = {
             "zones", "villages", "drivers", "staff", "students", "schedules",
             "parents", "student_parents", "absences", "trips", "trip_items",
-            "event_log", "notify_log", "broadcasts"
+            "event_log", "notify_log", "broadcasts", "fsm_storage", "workflow_payloads"
         }
-        assert len(tables) == 14
+        assert len(tables) == 16
         assert set(tables) == expected_tables
 
         # 3. 10 ta mahalla va 4 ta zona
