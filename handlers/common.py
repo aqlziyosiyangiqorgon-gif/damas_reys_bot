@@ -9,10 +9,9 @@ common_router = Router()
 def get_admin_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ O'quvchi qo'shish"), KeyboardButton(text="📊 Excel shablon")],
-            [KeyboardButton(text="🚗 Haydovchilar"), KeyboardButton(text="👥 Xodimlar")],
-            [KeyboardButton(text="📅 Dars jadvali"), KeyboardButton(text="🏘 Mahallalar")],
-            [KeyboardButton(text="📢 Xabar yuborish"), KeyboardButton(text="🗑 O'quvchini o'chirish")]
+            [KeyboardButton(text="🚐 Bugungi reyslar"), KeyboardButton(text="📊 Statistika / Hisobot")],
+            [KeyboardButton(text="📥 Excel boshqaruvi"), KeyboardButton(text="📢 Xabar yuborish")],
+            [KeyboardButton(text="👥 Foydalanuvchilar"), KeyboardButton(text="🚫 Bugun kelmaganlar")]
         ],
         resize_keyboard=True
     )

@@ -4,7 +4,8 @@ from aiogram import Router, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
 from config import settings
 from database.db import Database, normalize_phone
@@ -13,6 +14,23 @@ admin_router = Router()
 
 def is_admin(user_id: int) -> bool:
     return user_id in settings.admin_ids_list
+
+def get_admin_menu_kb() -> ReplyKeyboardMarkup:
+    """Admin uchun doimiy pastki Reply klaviatura."""
+    builder = ReplyKeyboardBuilder()
+    builder.row(
+        KeyboardButton(text="🚐 Bugungi reyslar"),
+        KeyboardButton(text="📊 Statistika / Hisobot")
+    )
+    builder.row(
+        KeyboardButton(text="📥 Excel boshqaruvi"),
+        KeyboardButton(text="📢 Xabar yuborish")
+    )
+    builder.row(
+        KeyboardButton(text="👥 Foydalanuvchilar"),
+        KeyboardButton(text="🚫 Bugun kelmaganlar")
+    )
+    return builder.as_markup(resize_keyboard=True)
 
 WEEKDAYS_UZ = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"]
 PAGE_SIZE = 10
@@ -1361,3 +1379,224 @@ async def cb_broadcast_cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("❌ Xabar yuborish bekor qilindi.")
     await callback.answer("Bekor qilindi.")
+
+# ============================================================================
+# Reply Menu Handlerlari (3-qadam yangilanishi)
+# ============================================================================
+
+@admin_router.message(F.text == "🚐 Bugungi reyslar")
+async def admin_today_trips_menu(message: types.Message, db: Database):
+    if not is_admin(message.from_user.id):
+        return
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    trips = await db.get_trips_by_date(today_str)
+    unapproved = await db.get_unapproved_trips(today_str)
+
+    if not trips:
+        await message.answer(
+            f"📅 <b>Bugun ({today_str}) uchun reyslar topilmadi.</b>\n"
+            f"Reyslar har kuni soat 21:00 da ertangi kun uchun avtomatik shakllantiriladi.",
+            reply_markup=get_admin_menu_kb(),
+            parse_mode="HTML"
+        )
+        return
+
+    header_text = f"🚐 <b>Bugungi ({today_str}) reyslar ro'yxati (Jami: {len(trips)} ta):</b>"
+    if unapproved:
+        approve_all_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✅ Barcha reyslarni tasdiqlash ({len(unapproved)} ta)", callback_data=f"admin_approve_trips:{today_str}")]
+        ])
+        await message.answer(header_text, reply_markup=approve_all_kb, parse_mode="HTML")
+    else:
+        await message.answer(header_text, reply_markup=get_admin_menu_kb(), parse_mode="HTML")
+
+    for t in trips:
+        dir_label = "🚖 Markazga kelish" if t["direction"] == "to_center" else "🏠 Uyga qaytish"
+        driver_str = t.get("driver_name") or "Biriktirilmagan"
+        items_cnt = len(t.get("items", []))
+        st_label = t["status"]
+        approved_ico = "✅ Tasdiqlangan" if t.get("approved") else "⏳ Tasdiqlanmagan"
+
+        card_text = (
+            f"📋 <b>Reys #{t['id']} — {dir_label}</b>\n"
+            f"⏰ Reja vaqti: <b>{t['planned_time']}</b>\n"
+            f"🚗 Haydovchi: <b>{driver_str}</b>\n"
+            f"👥 O'quvchilar: <b>{items_cnt} ta</b>\n"
+            f"🚦 Holati: <b>{st_label}</b> ({approved_ico})"
+        )
+
+        rows = [
+            [InlineKeyboardButton(text="⏰ Kechikish e'lon qilish", callback_data=f"admin_delay_trip:{t['id']}")]
+        ]
+        if not t.get("approved"):
+            rows.append([InlineKeyboardButton(text="✅ Reysni tasdiqlash", callback_data=f"admin_approve_trips:{today_str}")])
+
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+        await message.answer(card_text, reply_markup=kb, parse_mode="HTML")
+
+@admin_router.message(F.text == "📊 Statistika / Hisobot")
+async def admin_statistics_menu(message: types.Message, db: Database):
+    if not is_admin(message.from_user.id):
+        return
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    stats = await db.get_daily_transport_stats(today_str)
+
+    text = (
+        f"📊 <b>Bugungi transport hisoboti ({stats['date']}):</b>\n\n"
+        f"🚐 <b>Jami reyslar:</b> {stats['total_trips']} ta\n"
+        f"  • 🚖 Markazga kelish: <b>{stats['to_center_trips']} ta</b>\n"
+        f"  • 🏠 Uyga qaytish: <b>{stats['to_home_trips']} ta</b>\n\n"
+        f"👥 <b>O'quvchilar holati:</b>\n"
+        f"  • 🏁 Markazga yetib kelganlar: <b>{stats['arrived_count']} nafar</b>\n"
+        f"  • 📚 Hozir darsda: <b>{stats['in_class_count']} nafar</b>\n"
+        f"  • 🚫 Bugun darsga kelmaganlar: <b>{stats['absent_count']} nafar</b>\n\n"
+        f"🚗 <b>Faol haydovchilar soni:</b> <b>{stats['active_drivers']} nafar</b>"
+    )
+    await message.answer(text, reply_markup=get_admin_menu_kb(), parse_mode="HTML")
+
+@admin_router.message(F.text == "📥 Excel boshqaruvi")
+async def admin_excel_menu(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📄 Bo'sh shablon olish", callback_data="admin_excel_template")],
+        [InlineKeyboardButton(text="📤 Mavjud bazani Excelda yuklab olish", callback_data="admin_excel_export")],
+        [InlineKeyboardButton(text="📥 Yangi Excel yuklash yo'riqnomasi", callback_data="admin_excel_upload_info")]
+    ])
+    await message.answer(
+        "📥 <b>Excel boshqaruvi bo'limi:</b>\n\n"
+        "Quyidagi tugmalar orqali bo'sh shablon olishingiz, bazani to'liq Excelda yuklab olishingiz yoki yangi fayl yuklashingiz mumkin:",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+@admin_router.callback_query(F.data == "admin_excel_template")
+async def cb_admin_excel_template(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q!", show_alert=True)
+        return
+    from aiogram.types import FSInputFile
+    from services.excel_service import ExcelService
+    path = "shablon_oquvchilar.xlsx"
+    ExcelService.generate_template(path)
+    await callback.message.answer_document(
+        FSInputFile(path, filename="shablon_oquvchilar.xlsx"),
+        caption=(
+            "📄 <b>O'quvchilarni ommaviy yuklash uchun Excel shablon.</b>\n\n"
+            "Ustunlar: F.I.Sh | Mahalla | Ota telefoni | Ona telefoni | Dushanba-Shanba dars vaqtlari."
+        ),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@admin_router.callback_query(F.data == "admin_excel_export")
+async def cb_admin_excel_export(callback: types.CallbackQuery, db: Database):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q!", show_alert=True)
+        return
+    import os
+    from aiogram.types import FSInputFile
+    from services.excel_service import ExcelService
+
+    await callback.answer("Baza eksport qilinmoqda...")
+    file_path = await ExcelService.export_students_to_excel(db)
+    try:
+        await callback.message.answer_document(
+            FSInputFile(file_path, filename="baza_oquvchilar.xlsx"),
+            caption="📤 <b>Baza to'liq Excel formatida eksport qilindi.</b>\n\nBarcha faol o'quvchilar va ularning dars jadvallari mavjud.",
+            parse_mode="HTML"
+        )
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+@admin_router.callback_query(F.data == "admin_excel_upload_info")
+async def cb_admin_excel_upload_info(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q!", show_alert=True)
+        return
+    text = (
+        "📥 <b>Yangi Excel yuklash bo'yicha yo'riqnoma:</b>\n\n"
+        "1. Avval [📄 Bo'sh shablon olish] tugmasi orqali shablonni yuklab oling.\n"
+        "2. Shablon ustunlarini to'ldiring (vaqtlarni <code>09:00-11:00</code> formatida kiriting).\n"
+        "3. Tayyor bo'lgan <b>.xlsx</b> faylni to'g'ridan-to'g'ri ushbu bot chatiga fayl (document) sifatida tashlang.\n\n"
+        "<i>Bot avtomatik tarzda ma'lumotlarni tekshirib, saqlashdan oldin sizga hisobot taqdim etadi.</i>"
+    )
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await callback.answer()
+
+@admin_router.message(F.text == "👥 Foydalanuvchilar")
+async def admin_users_menu(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🚗 Haydovchilar (/haydovchilar)", callback_data="admin_nav:drivers"),
+            InlineKeyboardButton(text="👥 Xodimlar (/xodimlar)", callback_data="admin_nav:staff")
+        ],
+        [
+            InlineKeyboardButton(text="🏘 Mahallalar (/qishloqlar)", callback_data="admin_nav:villages"),
+            InlineKeyboardButton(text="👤 O'quvchilar ro'yxati", callback_data="admin_nav:students")
+        ]
+    ])
+    await message.answer(
+        "👥 <b>Foydalanuvchilar va tizim ma'lumotlari boshqaruvi:</b>\n\n"
+        "Kerakli bo'limni tanlang:",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+@admin_router.callback_query(F.data.startswith("admin_nav:"))
+async def cb_admin_nav(callback: types.CallbackQuery, db: Database):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q!", show_alert=True)
+        return
+    target = callback.data.split(":")[1]
+    if target == "drivers":
+        await callback.message.delete()
+        await cmd_haydovchilar(callback.message, db)
+    elif target == "staff":
+        await callback.message.delete()
+        await cmd_xodimlar(callback.message, db)
+    elif target == "villages":
+        await callback.message.delete()
+        await cmd_qishloqlar(callback.message, db)
+    elif target == "students":
+        students = await db.get_active_students()
+        if not students:
+            await callback.answer("Hozircha birorta ham faol o'quvchi yo'q!", show_alert=True)
+            return
+        kb = build_students_pagination_kb(students, 0, "edit_st")
+        await callback.message.edit_text("👤 <b>Faol o'quvchilar ro'yxati:</b>", reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+@admin_router.message(F.text == "🚫 Bugun kelmaganlar")
+async def admin_today_absences(message: types.Message, db: Database):
+    if not is_admin(message.from_user.id):
+        return
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    absences = await db.get_today_absences_detailed(today_str)
+
+    if not absences:
+        await message.answer(
+            f"✅ <b>Bugun ({today_str}) kelmagan deb belgilangan o'quvchilar yo'q.</b>\n"
+            f"Barcha o'quvchilar darsda yoki qatnovda!",
+            reply_markup=get_admin_menu_kb(),
+            parse_mode="HTML"
+        )
+        return
+
+    text = f"🚫 <b>Bugun ({today_str}) kelmagan o'quvchilar ro'yxati ({len(absences)} ta):</b>\n\n"
+    for idx, a in enumerate(absences, start=1):
+        v_name = a.get("village_name") or "Noma'lum mahalla"
+        reason = a.get("reason") or "Sabab ko'rsatilmagan"
+        reported_by = a.get("reported_by_role") or "Noma'lum"
+        phone = a.get("parent_phone") or "-"
+        text += (
+            f"{idx}. <b>{a['student_name']}</b> ({v_name})\n"
+            f"   • Sabab: <i>{reason}</i>\n"
+            f"   • Bildiruvchi: <b>{reported_by.capitalize()}</b> (Tel: {phone})\n\n"
+        )
+
+    await message.answer(text, reply_markup=get_admin_menu_kb(), parse_mode="HTML")
+

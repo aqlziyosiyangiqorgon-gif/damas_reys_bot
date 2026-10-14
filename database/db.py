@@ -634,7 +634,13 @@ class Database:
     async def get_trips_by_date(self, date: str) -> List[Dict[str, Any]]:
         conn = await self.get_connection()
         try:
-            cur = await conn.execute("SELECT * FROM trips WHERE date = ? ORDER BY planned_time ASC", (date,))
+            cur = await conn.execute("""
+                SELECT t.*, d.full_name as driver_name, d.phone as driver_phone
+                FROM trips t
+                LEFT JOIN drivers d ON t.driver_id = d.id
+                WHERE t.date = ?
+                ORDER BY t.planned_time ASC
+            """, (date,))
             trips = [dict(r) for r in await cur.fetchall()]
             for t in trips:
                 cur_items = await conn.execute("""
@@ -1905,6 +1911,85 @@ class Database:
             return cur.lastrowid
         finally:
             await conn.close()
+
+    async def get_daily_transport_stats(self, date_str: str) -> Dict[str, Any]:
+        """
+        Bugungi transport tizimining umumiy ko'rsatkichlari:
+        - Jami reyslar (kelish va qaytish)
+        - Markazga yetib kelganlar
+        - Hozir darsda o'tirganlar
+        - Bugun darsga kelmaganlar
+        - Faol haydovchilar
+        """
+        conn = await self.get_connection()
+        try:
+            # 1. Jami reyslar va yo'nalishlar
+            cur_trips = await conn.execute("""
+                SELECT 
+                    COUNT(*) as total_trips,
+                    COALESCE(SUM(CASE WHEN direction = 'to_center' THEN 1 ELSE 0 END), 0) as to_center_trips,
+                    COALESCE(SUM(CASE WHEN direction = 'to_home' THEN 1 ELSE 0 END), 0) as to_home_trips
+                FROM trips WHERE date = ?
+            """, (date_str,))
+            row_trips = dict(await cur_trips.fetchone() or {})
+            total_trips = row_trips.get("total_trips") or 0
+            to_center_trips = row_trips.get("to_center_trips") or 0
+            to_home_trips = row_trips.get("to_home_trips") or 0
+
+            # 2. O'quvchilar statuslari
+            cur_items = await conn.execute("""
+                SELECT 
+                    COUNT(DISTINCT CASE WHEN ti.status IN ('arrived', 'accepted', 'handed_over', 'dropped_off') THEN ti.student_id END) as arrived_count,
+                    COUNT(DISTINCT CASE WHEN ti.status = 'accepted' THEN ti.student_id END) as in_class_count
+                FROM trip_items ti
+                JOIN trips t ON ti.trip_id = t.id
+                WHERE t.date = ?
+            """, (date_str,))
+            row_items = dict(await cur_items.fetchone() or {})
+            arrived_count = row_items.get("arrived_count") or 0
+            in_class_count = row_items.get("in_class_count") or 0
+
+            # 3. Bugun kelmaganlar soni
+            cur_abs = await conn.execute("SELECT COUNT(DISTINCT student_id) FROM absences WHERE date = ?", (date_str,))
+            absent_count = (await cur_abs.fetchone())[0]
+
+            # 4. Faol haydovchilar soni
+            cur_drivers = await conn.execute("SELECT COUNT(*) FROM drivers WHERE is_active = 1")
+            active_drivers = (await cur_drivers.fetchone())[0]
+
+            return {
+                "date": date_str,
+                "total_trips": total_trips,
+                "to_center_trips": to_center_trips,
+                "to_home_trips": to_home_trips,
+                "arrived_count": arrived_count,
+                "in_class_count": in_class_count,
+                "absent_count": absent_count,
+                "active_drivers": active_drivers
+            }
+        finally:
+            await conn.close()
+
+    async def get_today_absences_detailed(self, date_str: str) -> List[Dict[str, Any]]:
+        """
+        Bugun absences jadvaliga tushgan barcha bolalar ro'yxati (sabablari va mahallasibilan).
+        """
+        conn = await self.get_connection()
+        try:
+            cur = await conn.execute("""
+                SELECT a.id, a.student_id, a.date, a.reported_by_role, a.reported_by_id, a.reason,
+                       s.full_name as student_name, s.parent_phone_1 as parent_phone,
+                       v.name as village_name
+                FROM absences a
+                JOIN students s ON a.student_id = s.id
+                LEFT JOIN villages v ON s.village_id = v.id
+                WHERE a.date = ?
+                ORDER BY a.id DESC
+            """, (date_str,))
+            return [dict(r) for r in await cur.fetchall()]
+        finally:
+            await conn.close()
+
 
 
 

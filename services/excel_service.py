@@ -190,3 +190,77 @@ class ExcelService:
             }
         finally:
             await conn.close()
+
+    @staticmethod
+    async def export_students_to_excel(db: Database, output_path: Optional[str] = None) -> str:
+        """
+        Bazadagi barcha faol o'quvchilar, ularning mahallasi, telefonlari va dars jadvallarini
+        yagona chiroyli formatlangan .xlsx faylga eksport qilish.
+        """
+        if not output_path:
+            output_path = f"baza_oquvchilar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "O'quvchilar Bazasi"
+
+        headers = [
+            "F.I.Sh",
+            "Mahalla",
+            "Ota telefoni",
+            "Ona telefoni",
+            "Dushanba",
+            "Seshanba",
+            "Chorshanba",
+            "Payshanba",
+            "Juma",
+            "Shanba"
+        ]
+        ws.append(headers)
+
+        conn = await db.get_connection()
+        try:
+            cur_students = await conn.execute("""
+                SELECT s.id, s.full_name, s.parent_phone_1, s.parent_phone_2, v.name as village_name
+                FROM students s
+                LEFT JOIN villages v ON s.village_id = v.id
+                WHERE s.is_active = 1
+                ORDER BY s.id ASC
+            """)
+            students = [dict(r) for r in await cur_students.fetchall()]
+
+            for s in students:
+                cur_sched = await conn.execute("""
+                    SELECT weekday, start_time, end_time
+                    FROM schedules
+                    WHERE student_id = ?
+                    ORDER BY weekday ASC
+                """, (s["id"],))
+                sched_rows = await cur_sched.fetchall()
+                sched_map = {row["weekday"]: f"{row['start_time']}-{row['end_time']}" for row in sched_rows}
+
+                row = [
+                    s["full_name"],
+                    s.get("village_name") or "",
+                    s.get("parent_phone_1") or "",
+                    s.get("parent_phone_2") or "",
+                    sched_map.get(0, ""),
+                    sched_map.get(1, ""),
+                    sched_map.get(2, ""),
+                    sched_map.get(3, ""),
+                    sched_map.get(4, ""),
+                    sched_map.get(5, "")
+                ]
+                ws.append(row)
+
+            # Ustunlar kengligini chiroyli qilish
+            for col in ws.columns:
+                max_len = max(len(str(cell.value or "")) for cell in col)
+                col_letter = openpyxl.utils.get_column_letter(col[0].column)
+                ws.column_dimensions[col_letter].width = max(max_len + 3, 14)
+
+            wb.save(output_path)
+            return output_path
+        finally:
+            await conn.close()
+
