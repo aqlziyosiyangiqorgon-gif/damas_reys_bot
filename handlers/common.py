@@ -60,7 +60,12 @@ async def cmd_start(message: types.Message, user_role: UserRole, db: Database):
         if parent:
             students = await db.get_parent_students(parent["id"])
             if students:
-                from handlers.parent import show_parent_dashboard
+                from handlers.parent import show_parent_dashboard, get_parent_menu_kb
+                await message.answer(
+                    "👨‍👩‍👧‍👦 <b>AQL ZIYOSI</b> ota-ona kabinetiga xush kelibsiz!",
+                    reply_markup=get_parent_menu_kb(),
+                    parse_mode="HTML"
+                )
                 await show_parent_dashboard(message, students, db)
                 return
 

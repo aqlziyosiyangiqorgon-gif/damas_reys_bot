@@ -150,6 +150,7 @@ class Database:
                 date TEXT NOT NULL,
                 reported_by_role TEXT NOT NULL,
                 reported_by_id INTEGER NOT NULL,
+                reason TEXT,
                 UNIQUE(student_id, date)
             );
 
@@ -235,6 +236,12 @@ class Database:
                     INSERT INTO villages (name, school_name, zone_id, travel_minutes, route_order)
                     VALUES (?, ?, ?, ?, ?)
                 """, INITIAL_VILLAGES)
+
+            # Migratsiya: absences jadvalida reason ustunini tekshirish
+            cur_col = await conn.execute("PRAGMA table_info(absences)")
+            columns = [row[1] for row in await cur_col.fetchall()]
+            if "reason" not in columns:
+                await conn.execute("ALTER TABLE absences ADD COLUMN reason TEXT")
 
             await conn.commit()
         finally:
@@ -1394,6 +1401,162 @@ class Database:
                 "trip_id": driver_info["trip_id"] if driver_info else None
             }
             return True, "success", result_info
+        finally:
+            await conn.close()
+
+    async def mark_student_absent_with_reason(
+        self,
+        student_id: int,
+        date_str: str,
+        role: str,
+        actor_id: int,
+        reason: str
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """
+        O'quvchini izoh (sabab) bilan kelmaydi deb belgilash.
+        Agar bola allaqachon mashinada (picked_up yoki keyin) bo'lsa xatolik qaytaradi.
+        """
+        conn = await self.get_connection()
+        try:
+            cur_st = await conn.execute("""
+                SELECT s.id, s.full_name, s.parent_phone_1, v.name as village_name
+                FROM students s
+                JOIN villages v ON s.village_id = v.id
+                WHERE s.id = ?
+            """, (student_id,))
+            st_row = await cur_st.fetchone()
+            if not st_row:
+                return False, "student_not_found", None
+            student_info = dict(st_row)
+
+            # Ushbu sanadagi reys elementlarini tekshirish
+            cur_items = await conn.execute("""
+                SELECT ti.id, ti.trip_id, ti.status as item_status,
+                       t.direction, t.status as trip_status, t.driver_id,
+                       d.telegram_id as driver_tg_id, d.full_name as driver_name
+                FROM trip_items ti
+                JOIN trips t ON ti.trip_id = t.id
+                LEFT JOIN drivers d ON t.driver_id = d.id
+                WHERE ti.student_id = ? AND t.date = ?
+            """, (student_id, date_str))
+            trip_items = [dict(r) for r in await cur_items.fetchall()]
+
+            # ALLAQACHON MASHINADA BO'LSA HIMOYA
+            for it in trip_items:
+                if it["item_status"] in ["picked_up", "arrived", "accepted", "dropped_off", "handed_over"]:
+                    return False, "already_picked_up", None
+
+            # Absences jadvalida bor-yo'qligini tekshirish
+            cur_abs = await conn.execute(
+                "SELECT id FROM absences WHERE student_id = ? AND date = ?",
+                (student_id, date_str)
+            )
+            if await cur_abs.fetchone():
+                return False, "already_marked", None
+
+            await conn.execute("""
+                INSERT INTO absences (student_id, date, reported_by_role, reported_by_id, reason)
+                VALUES (?, ?, ?, ?, ?)
+            """, (student_id, date_str, role, actor_id, reason))
+
+            # Kunlik trip_items larni absent qilish
+            driver_info = None
+            for it in trip_items:
+                await conn.execute(
+                    "UPDATE trip_items SET status = 'absent' WHERE id = ?",
+                    (it["id"],)
+                )
+                if it.get("driver_tg_id"):
+                    driver_info = {
+                        "driver_tg_id": it["driver_tg_id"],
+                        "driver_name": it["driver_name"],
+                        "trip_id": it["trip_id"]
+                    }
+
+            # Audit log
+            now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            await conn.execute("""
+                INSERT INTO event_log (ts, actor_role, actor_id, action, student_id)
+                VALUES (?, ?, ?, 'mark_absent', ?)
+            """, (now_ts, role, actor_id, student_id))
+
+            await conn.commit()
+
+            result_info = {
+                "student_name": student_info["full_name"],
+                "village_name": student_info["village_name"],
+                "parent_phone": student_info.get("parent_phone_1") or "Kiritilmagan",
+                "driver_tg_id": driver_info["driver_tg_id"] if driver_info else None,
+                "driver_name": driver_info["driver_name"] if driver_info else None,
+                "trip_id": driver_info["trip_id"] if driver_info else None,
+                "reason": reason
+            }
+            return True, "success", result_info
+        finally:
+            await conn.close()
+
+    async def get_student_current_status(self, student_id: int, date_str: str) -> Dict[str, Any]:
+        """
+        O'quvchining bugungi kungi reysdagi holatini aniqlash.
+        """
+        conn = await self.get_connection()
+        try:
+            # 1. Avval absences jadvalini tekshiramiz
+            cur_abs = await conn.execute(
+                "SELECT reason FROM absences WHERE student_id = ? AND date = ?",
+                (student_id, date_str)
+            )
+            abs_row = await cur_abs.fetchone()
+            if abs_row:
+                reason = abs_row[0] or ""
+                return {
+                    "status_code": "absent",
+                    "status_text": "Bugun kelmaydi",
+                    "reason": reason,
+                    "trip": None
+                }
+
+            # 2. Bugungi reys elementlarini olish (oxirgi reys)
+            cur = await conn.execute("""
+                SELECT ti.id, ti.status as item_status, ti.picked_at, ti.arrived_at, ti.accepted_at, ti.handed_at, ti.dropped_at,
+                       t.id as trip_id, t.direction, t.planned_time, t.status as trip_status,
+                       d.full_name as driver_name, d.phone as driver_phone
+                FROM trip_items ti
+                JOIN trips t ON ti.trip_id = t.id
+                LEFT JOIN drivers d ON t.driver_id = d.id
+                WHERE ti.student_id = ? AND t.date = ?
+                ORDER BY ti.id DESC
+            """, (student_id, date_str))
+            rows = [dict(r) for r in await cur.fetchall()]
+
+            if not rows:
+                return {
+                    "status_code": "no_trip",
+                    "status_text": "Bugun reys rejalashtirilmagan",
+                    "reason": None,
+                    "trip": None
+                }
+
+            latest = rows[0]
+            item_status = latest["item_status"]
+
+            status_map = {
+                "pending": "Kutmoqda",
+                "picked_up": "Mashinada",
+                "at_center": "Markazga yetib kelgan",
+                "accepted": "Darsda",
+                "handed_over": "Haydovchiga topshirilgan",
+                "dropped_off": "Uyga yetkazilgan",
+                "absent": "Bugun kelmaydi"
+            }
+            status_text = status_map.get(item_status, "Kutmoqda")
+
+            return {
+                "status_code": item_status,
+                "status_text": status_text,
+                "reason": None,
+                "trip": latest
+            }
         finally:
             await conn.close()
 
