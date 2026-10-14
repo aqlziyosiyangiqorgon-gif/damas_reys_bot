@@ -243,7 +243,7 @@ async def test_phase_9_delay_and_broadcast():
         mock_bot.send_message.assert_called_with(
             chat_id=driver_tg_id,
             text="E'tibor bering: ertaga darslar soat 08:30 da boshlanadi!",
-            parse_mode="HTML"
+            parse_mode=None
         )
 
         # Broadcasts jadvalida yozuv borligini tekshirish

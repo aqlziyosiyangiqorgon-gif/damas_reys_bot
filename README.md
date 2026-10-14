@@ -31,6 +31,7 @@ SQLite fayli `DB_PATH`da saqlanadi. FSM jarayonlari ham shu bazada saqlanadi, sh
 ## Jadval va zaxira
 
 - Kunlik reja `DAILY_PLAN_TIME`da tuziladi.
+- Admin reja vaqtida bot ishlamagan bo'lsa, `🧩 Bugungi reyslarni tuzish` tugmasi bilan bugungi reyslarni qo'lda tuzishi mumkin. Tasdiqlangan yoki boshlangan reja qayta yozilmaydi.
 - Tasdiqlanmagan reyslar `AUTO_APPROVE_TIME`da avtomatik tasdiqlanadi.
 - Haydovchi eslatmalari har daqiqada ko'rib chiqiladi.
 - SQLite zaxirasi har kuni soat 23:00 da `BACKUP_DIR` ichiga onlayn SQLite backup API orqali olinadi. Standart saqlash muddati 7 kun (`BACKUP_RETENTION_DAYS`).
@@ -51,9 +52,10 @@ Deploydan keyin loglarda token yoki maxfiy qiymatlarni ulashmang. Volume yo'li n
 - `/qoshish` — o'quvchi va dars jadvalini qo'shish
 - `/shablon` va `.xlsx` yuklash — ommaviy import; bot oldindan ko'rish va tasdiqlash so'raydi
 - `/haydovchilar`, `/xodimlar` — transport jamoasini boshqarish
+- `/myid` — Telegram ID’ni ko'rish; admin huquqi `ADMIN_IDS` sozlamasiga bog'liq
 - `/qishloqlar` — marshrut va mahalla ma'lumotlari
-- `/jadval`, `/ozgartirish`, `/ochirish` — o'quvchi va jadvalni boshqarish
-- `/bugun`, `/ertaga` — reyslarni ko'rish va kunlik rejani boshqarish
+- `/jadval`, `/ozgartirish`, `/ochirish` — o'quvchi va jadvalni boshqarish; tahrirlashda har bir o'quvchiga haydovchi biriktirish mumkin
+- `🚐 Bugungi reyslar` — bugungi reyslarni va ulardagi o'quvchilarni ko'rish
 - `/xabar` — auditoriyaga xabar yuborish
 
 Ota-onalar `/start` orqali telefonlarini tasdiqlaydi, so'ng farzand bog'lanishini tasdiqlaydi. Haydovchi va markaz xodimlari faqat o'z vazifasiga tegishli reys amallarini bajaradi.

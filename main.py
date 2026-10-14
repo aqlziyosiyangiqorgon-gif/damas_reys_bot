@@ -52,6 +52,7 @@ async def main():
 
     # Scheduler xizmatini ishga tushirish (APScheduler)
     scheduler = SchedulerService(db=db, bot=bot)
+    dp["scheduler"] = scheduler
     scheduler.start()
 
     try:

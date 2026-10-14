@@ -71,15 +71,19 @@ class TripBuilder:
             return [], warnings
 
         # 2. Zonalar bo'yicha guruhlash
-        zones_map: Dict[int, List[Dict[str, Any]]] = {}
+        # Do not put children assigned to different drivers into one trip.
+        zones_map: Dict[Tuple[int, Optional[int]], List[Dict[str, Any]]] = {}
         for sc in valid_schedules:
             z_id = sc.get("zone_id", 1)
-            zones_map.setdefault(z_id, []).append(sc)
+            key = (z_id, sc.get("default_driver_id"))
+            zones_map.setdefault(key, []).append(sc)
 
         all_trips: List[Dict[str, Any]] = []
 
         # Har bir zona uchun reyslarni alohida hisoblash
-        for zone_id, zone_schedules in sorted(zones_map.items()):
+        for (zone_id, _driver_id), zone_schedules in sorted(
+            zones_map.items(), key=lambda item: (item[0][0], item[0][1] or 0)
+        ):
             # A) Kelish reyslari (to_center)
             center_trips = self._build_to_center_trips(zone_id, zone_schedules)
             all_trips.extend(center_trips)

@@ -32,14 +32,14 @@ async def test_admin_cabinet_full_flow():
     try:
         await db.init_db()
 
-        # 1. Admin Reply klaviaturasi tekshiruvi (6 ta tugma)
+        # 1. Admin Reply klaviaturasi tekshiruvi
         kb = get_admin_menu_kb()
         assert isinstance(kb, ReplyKeyboardMarkup)
         buttons = [b.text for row in kb.keyboard for b in row]
         expected_buttons = [
             "🚐 Bugungi reyslar", "📊 Statistika / Hisobot",
             "📥 Excel boshqaruvi", "📢 Xabar yuborish",
-            "👥 Foydalanuvchilar", "🚫 Bugun kelmaganlar"
+            "👥 Foydalanuvchilar", "🚫 Bugun kelmaganlar", "🧩 Bugungi reyslarni tuzish"
         ]
         for eb in expected_buttons:
             assert eb in buttons, f"Tugma topilmadi: {eb}"
@@ -113,6 +113,7 @@ async def test_admin_cabinet_full_flow():
 
         await admin_today_trips_menu(msg_trips, db)
         assert msg_trips.answer.call_count >= 2  # Sarlavha + reys kartasi
+        assert any("Temur Po'latov" in call.args[0] for call in msg_trips.answer.await_args_list)
 
         # 6. "👥 Foydalanuvchilar" tekshiruvi
         msg_users = MagicMock(spec=Message)

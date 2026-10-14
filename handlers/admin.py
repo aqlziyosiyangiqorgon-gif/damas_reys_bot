@@ -12,6 +12,7 @@ from config import settings
 from database.db import Database, normalize_phone
 from utils.text import escape_html
 from utils.telegram import safe_telegram_call
+from services.scheduler_service import SchedulerService
 
 admin_router = Router()
 
@@ -33,6 +34,7 @@ def get_admin_menu_kb() -> ReplyKeyboardMarkup:
         KeyboardButton(text="👥 Foydalanuvchilar"),
         KeyboardButton(text="🚫 Bugun kelmaganlar")
     )
+    builder.row(KeyboardButton(text="🧩 Bugungi reyslarni tuzish"))
     return builder.as_markup(resize_keyboard=True)
 
 WEEKDAYS_UZ = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"]
@@ -88,6 +90,14 @@ class BroadcastStates(StatesGroup):
     waiting_for_value = State()
     waiting_for_content = State()
     confirming = State()
+
+
+async def _edit_broadcast_message(message: types.Message, text: str) -> bool:
+    """Edit broadcast preview/status correctly for text and photo messages."""
+    photos = getattr(message, "photo", None)
+    if isinstance(photos, (list, tuple)) and photos:
+        return await safe_telegram_call(message.edit_caption, caption=text, parse_mode="HTML")
+    return await safe_telegram_call(message.edit_text, text=text, parse_mode="HTML")
 
 # --- Helper: Student Pagination Keyboard ---
 def build_students_pagination_kb(students: list, page: int, action_prefix: str) -> InlineKeyboardMarkup:
@@ -595,13 +605,18 @@ async def process_student_time(message: types.Message, state: FSMContext, db: Da
 
     await state.clear()
     phone2_str = f"\n2-Telefon: {data.get('parent_phone_2')}" if data.get("parent_phone_2") else ""
+    assign_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚗 Haydovchi biriktirish", callback_data=f"assign_student_driver:{student_id}")]
+    ])
     await message.answer(
         f"✅ <b>O'quvchi muvaffaqiyatli saqlandi!</b>\n\n"
         f"👤 F.I.Sh: <b>{escape_html(data['full_name'])}</b>\n"
         f"🏘 Mahalla: <b>{escape_html(data.get('village_name', ''))}</b>\n"
         f"📞 Asosiy telefon: <b>{escape_html(data['parent_phone_1'])}</b>{escape_html(phone2_str)}\n"
         f"📅 Kunlar: <b>{escape_html(data.get('days_label', ''))}</b>\n"
-        f"⏱ Dars vaqti: <b>{escape_html(start_time)} - {escape_html(end_time)}</b>",
+        f"⏱ Dars vaqti: <b>{escape_html(start_time)} - {escape_html(end_time)}</b>\n\n"
+        f"Haydovchi biriktirilmasa, reys tuzilganda qishloq haydovchisi yoki yagona faol haydovchi ishlatiladi.",
+        reply_markup=assign_kb,
         parse_mode="HTML"
     )
 
@@ -651,6 +666,7 @@ async def cb_select_student_to_edit(callback: types.CallbackQuery, state: FSMCon
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Ism-familiyani o'zgartirish", callback_data="field_name")],
         [InlineKeyboardButton(text="🏘 Mahallani o'zgartirish", callback_data="field_village")],
+        [InlineKeyboardButton(text="🚗 Haydovchini biriktirish", callback_data="field_driver")],
         [InlineKeyboardButton(text="📞 Telefon raqamlarni o'zgartirish", callback_data="field_phone")],
         [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin_cancel")]
     ])
@@ -658,6 +674,7 @@ async def cb_select_student_to_edit(callback: types.CallbackQuery, state: FSMCon
     await callback.message.edit_text(
         f"Tanlandi: <b>{escape_html(student['full_name'])}</b>\n"
         f"Mahalla: <b>{escape_html(student['village_name'])}</b>\n"
+        f"Haydovchi: <b>{escape_html(student.get('assigned_driver_name') or 'Avtomatik biriktirish')}</b>\n"
         f"Telefon: <b>{escape_html(student['parent_phone_1'])}</b>{escape_html(p2)}\n\n"
         f"Qaysi ma'lumotni o'zgartirmoqchisiz?",
         reply_markup=kb,
@@ -698,6 +715,81 @@ async def cb_edit_field_village(callback: types.CallbackQuery, state: FSMContext
     await state.set_state(EditStudentStates.waiting_for_new_village)
     await callback.message.edit_text("Yangi mahallani tanlang:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
+
+
+async def show_student_driver_choices(message: types.Message, student: dict, db: Database, *, edit: bool = False):
+    drivers = [driver for driver in await db.get_drivers() if driver["is_active"]]
+    rows = [
+        [InlineKeyboardButton(text="♻️ Avtomatik (qishloq / yagona haydovchi)",
+                              callback_data=f"set_student_driver:{student['id']}:none")]
+    ]
+    for driver in drivers:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"🚗 {driver['full_name']}",
+                callback_data=f"set_student_driver:{student['id']}:{driver['id']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin_cancel")])
+    prompt = "O'quvchiga biriktiriladigan faol haydovchini tanlang:"
+    if not drivers:
+        prompt = "Faol haydovchi topilmadi. Avval /haydovchilar bo'limidan haydovchi qo'shing."
+    keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+    if edit:
+        await message.edit_text(prompt, reply_markup=keyboard)
+    else:
+        await message.answer(prompt, reply_markup=keyboard)
+
+
+@admin_router.callback_query(F.data.startswith("assign_student_driver:"))
+async def cb_assign_new_student_driver(callback: types.CallbackQuery, state: FSMContext, db: Database):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    student_id = int(callback.data.split(":")[1])
+    student = await db.get_student_by_id(student_id)
+    if not student:
+        await callback.answer("O'quvchi topilmadi", show_alert=True)
+        return
+    await state.update_data(student_id=student_id, student_data=student)
+    await state.set_state(EditStudentStates.selecting_field)
+    await show_student_driver_choices(callback.message, student, db, edit=True)
+    await callback.answer()
+
+
+@admin_router.callback_query(EditStudentStates.selecting_field, F.data == "field_driver")
+async def cb_edit_field_driver(callback: types.CallbackQuery, state: FSMContext, db: Database):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    data = await state.get_data()
+    student = data.get("student_data")
+    if not student:
+        await callback.answer("O'quvchi tanlanmagan", show_alert=True)
+        return
+    await show_student_driver_choices(callback.message, student, db, edit=True)
+    await callback.answer()
+
+
+@admin_router.callback_query(EditStudentStates.selecting_field, F.data.startswith("set_student_driver:"))
+async def cb_save_student_driver(callback: types.CallbackQuery, state: FSMContext, db: Database):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    _, raw_student_id, raw_driver_id = callback.data.split(":", 2)
+    student_id = int(raw_student_id)
+    driver_id = int(raw_driver_id) if raw_driver_id != "none" else None
+    if not await db.set_student_driver(student_id, driver_id):
+        await callback.answer("O'quvchi yoki faol haydovchi topilmadi", show_alert=True)
+        return
+    await state.clear()
+    if driver_id is None:
+        status = "Avtomatik biriktirish yoqildi (qishloq haydovchisi yoki yagona faol haydovchi)."
+    else:
+        driver = await db.get_driver_by_id(driver_id)
+        status = f"Haydovchi biriktirildi: {escape_html(driver['full_name'] if driver else '')}"
+    await callback.message.edit_text(f"✅ {status}\nYangi reyslar qayta tuzilganda qo'llanadi.", parse_mode="HTML")
+    await callback.answer("Saqlandi")
 
 @admin_router.callback_query(EditStudentStates.waiting_for_new_village, F.data.startswith("set_new_vil:"))
 async def process_new_student_village(callback: types.CallbackQuery, state: FSMContext, db: Database):
@@ -1298,6 +1390,11 @@ async def process_broadcast_content(message: types.Message, state: FSMContext, d
         await message.answer("Xabar bo'sh bo'lishi mumkin emas!")
         return
 
+    if len(text) > (900 if media_id else 4096):
+        limit = "900" if media_id else "4096"
+        await message.answer(f"Xabar juda uzun. Iltimos, {limit} belgidan oshirmang.")
+        return
+
     audience = await db.get_broadcast_audience(aud_type, aud_val)
     batch_id = uuid.uuid4().hex[:8]
 
@@ -1313,7 +1410,7 @@ async def process_broadcast_content(message: types.Message, state: FSMContext, d
     await state.clear()
 
     preview_text = (
-        f"📢 <b>Xabar ko'rinishi:</b>\n\n{text}\n\n"
+        f"📢 <b>Xabar ko'rinishi:</b>\n\n{escape_html(text)}\n\n"
         f"👥 Qabul qiluvchilar soni: <b>{len(audience)} kishi</b>.\n\n"
         f"Xabarni tarqatishni tasdiqlaysizmi?"
     )
@@ -1348,7 +1445,7 @@ async def cb_broadcast_send(callback: types.CallbackQuery, db: Database):
     text = bc_data["text"]
     media_id = bc_data["media_id"]
 
-    await callback.message.edit_text("⏳ Xabar tarqatilmoqda, iltimos kuting...")
+    await _edit_broadcast_message(callback.message, "⏳ Xabar tarqatilmoqda, iltimos kuting...")
 
     sent = 0
     failed = 0
@@ -1359,9 +1456,13 @@ async def cb_broadcast_send(callback: types.CallbackQuery, db: Database):
             continue
         try:
             if media_id:
-                delivered = await safe_telegram_call(callback.bot.send_photo, chat_id=tg_id, photo=media_id, caption=text, parse_mode="HTML")
+                delivered = await safe_telegram_call(
+                    callback.bot.send_photo, chat_id=tg_id, photo=media_id, caption=text, parse_mode=None
+                )
             else:
-                delivered = await safe_telegram_call(callback.bot.send_message, chat_id=tg_id, text=text, parse_mode="HTML")
+                delivered = await safe_telegram_call(
+                    callback.bot.send_message, chat_id=tg_id, text=text, parse_mode=None
+                )
             if delivered:
                 sent += 1
             else:
@@ -1381,12 +1482,11 @@ async def cb_broadcast_send(callback: types.CallbackQuery, db: Database):
         failed=failed
     )
 
-    await callback.message.edit_text(
+    await _edit_broadcast_message(callback.message,
         f"📊 <b>Xabar tarqatish yakunlandi:</b>\n\n"
         f"✅ Yuborildi: <b>{sent} ta</b>\n"
         f"❌ Yetmadi (bloklagan/kirmagan): <b>{failed} ta</b>\n"
-        f"Jami auditoriya: <b>{len(audience)} ta</b>",
-        parse_mode="HTML"
+        f"Jami auditoriya: <b>{len(audience)} ta</b>"
     )
     await callback.answer("Tarqatildi!")
 
@@ -1402,7 +1502,7 @@ async def cb_broadcast_cancel(callback: types.CallbackQuery, state: FSMContext, 
         PENDING_BROADCASTS.pop(batch_id, None)
         if db:
             await db.delete_workflow_payload(batch_id, callback.from_user.id)
-    await callback.message.edit_text("❌ Xabar yuborish bekor qilindi.")
+    await _edit_broadcast_message(callback.message, "❌ Xabar yuborish bekor qilindi.")
     await callback.answer("Bekor qilindi.")
 
 # ============================================================================
@@ -1418,10 +1518,13 @@ async def admin_today_trips_menu(message: types.Message, db: Database):
     unapproved = await db.get_unapproved_trips(today_str)
 
     if not trips:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧩 Bugungi reyslarni tuzish", callback_data="admin_generate_today")]
+        ])
         await message.answer(
             f"📅 <b>Bugun ({today_str}) uchun reyslar topilmadi.</b>\n"
-            f"Reyslar har kuni soat 21:00 da ertangi kun uchun avtomatik shakllantiriladi.",
-            reply_markup=get_admin_menu_kb(),
+            f"Avtomatik reja {escape_html(settings.DAILY_PLAN_TIME)} da tuziladi. Agar bot o'sha vaqtda ishlamagan bo'lsa, reyslarni hozir tuzing.",
+            reply_markup=kb,
             parse_mode="HTML"
         )
         return
@@ -1441,23 +1544,132 @@ async def admin_today_trips_menu(message: types.Message, db: Database):
         items_cnt = len(t.get("items", []))
         st_label = t["status"]
         approved_ico = "✅ Tasdiqlangan" if t.get("approved") else "⏳ Tasdiqlanmagan"
+        students_text = "\n".join(
+            f"  • {escape_html(item['full_name'])} — {escape_html(item['village_name'])}"
+            for item in t.get("items", [])
+        ) or "  • O'quvchilar ro'yxati bo'sh"
 
         card_text = (
             f"📋 <b>Reys #{t['id']} — {dir_label}</b>\n"
             f"⏰ Reja vaqti: <b>{escape_html(t['planned_time'])}</b>\n"
             f"🚗 Haydovchi: <b>{escape_html(driver_str)}</b>\n"
-            f"👥 O'quvchilar: <b>{items_cnt} ta</b>\n"
+            f"👥 O'quvchilar ({items_cnt} ta):\n{students_text}\n"
             f"🚦 Holati: <b>{escape_html(st_label)}</b> ({approved_ico})"
         )
 
         rows = [
-            [InlineKeyboardButton(text="⏰ Kechikish e'lon qilish", callback_data=f"admin_delay_trip:{t['id']}")]
+            [InlineKeyboardButton(text="⏰ Kechikish e'lon qilish", callback_data=f"admin_delay_trip:{t['id']}")],
+            [InlineKeyboardButton(
+                text="🚗 Haydovchini biriktirish" if not t.get("driver_id") else "🔄 Haydovchini o'zgartirish",
+                callback_data=f"admin_assign_trip:{t['id']}",
+            )],
         ]
         if not t.get("approved"):
             rows.append([InlineKeyboardButton(text="✅ Reysni tasdiqlash", callback_data=f"admin_approve_trips:{today_str}")])
 
         kb = InlineKeyboardMarkup(inline_keyboard=rows)
         await message.answer(card_text, reply_markup=kb, parse_mode="HTML")
+
+
+@admin_router.callback_query(F.data.startswith("admin_assign_trip:"))
+async def cb_admin_assign_trip(callback: types.CallbackQuery, db: Database):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    trip_id = int(callback.data.split(":")[1])
+    trip = await db.get_trip_details(trip_id)
+    if not trip or trip["status"] not in {"planned", "approved"}:
+        await callback.answer("Bu reysga haydovchini endi o'zgartirib bo'lmaydi", show_alert=True)
+        return
+    drivers = [driver for driver in await db.get_drivers() if driver["is_active"]]
+    if not drivers:
+        await callback.answer("Faol haydovchilar topilmadi", show_alert=True)
+        return
+    rows = [
+        [InlineKeyboardButton(
+            text=f"🚗 {escape_html(driver['full_name'])}",
+            callback_data=f"admin_set_trip_driver:{trip_id}:{driver['id']}",
+        )]
+        for driver in drivers
+    ]
+    rows.append([InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin_cancel")])
+    await callback.message.edit_text(
+        f"Reys #{trip_id} uchun faol haydovchini tanlang:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("admin_set_trip_driver:"))
+async def cb_admin_set_trip_driver(callback: types.CallbackQuery, db: Database):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    _, raw_trip_id, raw_driver_id = callback.data.split(":", 2)
+    trip_id, driver_id = int(raw_trip_id), int(raw_driver_id)
+    if not await db.assign_driver_to_trip(trip_id, driver_id):
+        await callback.answer("Reys boshlanib ketgan yoki haydovchi faol emas", show_alert=True)
+        return
+    driver = await db.get_driver_by_id(driver_id)
+    await callback.message.edit_text(
+        f"✅ Reys #{trip_id} ga haydovchi biriktirildi: <b>{escape_html(driver['full_name'] if driver else '')}</b>.",
+        parse_mode="HTML",
+    )
+    await callback.answer("Biriktirildi")
+
+
+async def _generate_today_plan(message: types.Message, db: Database, scheduler: SchedulerService) -> None:
+    now = now_tashkent()
+    date_str = now.strftime("%Y-%m-%d")
+    schedules = await db.get_day_schedules(now.weekday())
+    success, reason, trips = await scheduler.run_daily_plan(target_date=date_str)
+    if not success:
+        await message.answer(
+            "⚠️ Bugungi reja qayta tuzilmadi: bugungi reyslar tasdiqlangan, boshlangan yoki yakunlangan. Mavjud reja o'zgartirilmadi.",
+            reply_markup=get_admin_menu_kb(),
+        )
+        return
+    if not trips:
+        if not schedules:
+            detail = "Bugungi hafta kuni uchun birorta faol o'quvchining dars jadvali yo'q."
+        else:
+            absent_ids = set(await db.get_absent_student_ids(date_str))
+            if all(row["student_id"] in absent_ids for row in schedules):
+                detail = "Bugungi jadvaldagi barcha o'quvchilar kelmaslikka belgilangan."
+            else:
+                detail = "Bugun reysga mos keladigan dars vaqtlari topilmadi."
+        await message.answer(f"📅 {escape_html(date_str)}: {detail}", reply_markup=get_admin_menu_kb())
+        return
+
+    unassigned_count = sum(1 for trip in trips if not trip.get("driver_id"))
+    text = (
+        f"✅ <b>{escape_html(date_str)} uchun reja tuzildi.</b>\n"
+        f"🚐 Reyslar: <b>{len(trips)}</b>\n"
+        f"👥 Jadvaldan olingan o'quvchilar: <b>{sum(len(trip.get('items', [])) for trip in trips)}</b>"
+    )
+    if unassigned_count:
+        text += (
+            f"\n⚠️ Haydovchisiz reyslar: <b>{unassigned_count}</b>. "
+            "O'quvchini /ozgartirish → Haydovchini biriktirish orqali tayinlang."
+        )
+    text += "\n\nReyslarni ko'rish uchun «🚐 Bugungi reyslar» tugmasini bosing."
+    await message.answer(text, reply_markup=get_admin_menu_kb(), parse_mode="HTML")
+
+
+@admin_router.message(F.text == "🧩 Bugungi reyslarni tuzish")
+async def admin_generate_today_plan(message: types.Message, db: Database, scheduler: SchedulerService):
+    if not is_admin(message.from_user.id):
+        return
+    await _generate_today_plan(message, db, scheduler)
+
+
+@admin_router.callback_query(F.data == "admin_generate_today")
+async def cb_admin_generate_today_plan(callback: types.CallbackQuery, db: Database, scheduler: SchedulerService):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await callback.answer("Bugungi reja tuzilmoqda…")
+    await _generate_today_plan(callback.message, db, scheduler)
 
 @admin_router.message(F.text == "📊 Statistika / Hisobot")
 async def admin_statistics_menu(message: types.Message, db: Database):
@@ -1553,6 +1765,10 @@ async def cb_admin_excel_upload_info(callback: types.CallbackQuery):
 @admin_router.message(F.text == "👥 Foydalanuvchilar")
 async def admin_users_menu(message: types.Message):
     if not is_admin(message.from_user.id):
+        await message.answer(
+            f"Bu bo'lim adminlar uchun. Sizning Telegram ID: <code>{message.from_user.id}</code>.\n"
+            "ID ni ADMIN_IDS sozlamasiga qo'shib, botni qayta ishga tushiring yoki /myid buyrug'idan foydalaning."
+        )
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -1572,7 +1788,7 @@ async def admin_users_menu(message: types.Message):
     )
 
 @admin_router.callback_query(F.data.startswith("admin_nav:"))
-async def cb_admin_nav(callback: types.CallbackQuery, db: Database):
+async def cb_admin_nav(callback: types.CallbackQuery, db: Database, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q!", show_alert=True)
         return
@@ -1592,6 +1808,7 @@ async def cb_admin_nav(callback: types.CallbackQuery, db: Database):
             await callback.answer("Hozircha birorta ham faol o'quvchi yo'q!", show_alert=True)
             return
         kb = build_students_pagination_kb(students, 0, "edit_st")
+        await state.set_state(EditStudentStates.selecting_student)
         await callback.message.edit_text("👤 <b>Faol o'quvchilar ro'yxati:</b>", reply_markup=kb, parse_mode="HTML")
     await callback.answer()
 

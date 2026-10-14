@@ -18,6 +18,7 @@ from database.db import Database, normalize_phone
 from models.enums import UserRole
 from utils.text import escape_html
 from utils.telegram import safe_telegram_call
+from utils.start_banner import answer_start
 
 parent_router = Router()
 
@@ -58,21 +59,21 @@ async def parent_start(message: types.Message, db: Database, user_role: UserRole
         if parent:
             students = await db.get_parent_students(parent["id"])
             if students:
-                await message.answer(
+                await answer_start(
+                    message,
                     "👨‍👩‍👧‍👦 <b>AQL ZIYOSI</b> ota-ona kabinetiga xush kelibsiz!",
-                    reply_markup=get_parent_menu_kb(),
-                    parse_mode="HTML"
+                    reply_markup=get_parent_menu_kb()
                 )
                 await show_parent_dashboard(message, students, db)
                 return
 
     # Ro'yxatdan o'tmagan (GUEST) bo'lsa telefon raqamini so'rash
-    await message.answer(
+    await answer_start(
+        message,
         "Assalomu alaykum! <b>AQL ZIYOSI</b> o'quvchilar transport botiga xush kelibsiz.\n\n"
         "Farzandingizning qatnovini real vaqtda kuzatish uchun iltimos, "
         "quyidagi tugma orqali <b>telefon raqamingizni yuboring</b>:",
-        reply_markup=get_contact_keyboard(),
-        parse_mode="HTML"
+        reply_markup=get_contact_keyboard()
     )
 
 # --- 2. Kontakt qabul qilish va tekshirish ---

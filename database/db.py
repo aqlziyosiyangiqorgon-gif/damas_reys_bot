@@ -115,6 +115,7 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 full_name TEXT NOT NULL,
                 village_id INTEGER NOT NULL REFERENCES villages(id) ON DELETE RESTRICT,
+                driver_id INTEGER REFERENCES drivers(id) ON DELETE SET NULL,
                 parent_phone_1 TEXT NOT NULL,
                 parent_phone_2 TEXT,
                 is_active INTEGER DEFAULT 1
@@ -260,6 +261,14 @@ class Database:
             columns = [row[1] for row in await cur_col.fetchall()]
             if "reason" not in columns:
                 await conn.execute("ALTER TABLE absences ADD COLUMN reason TEXT")
+
+            # Existing DBs keep working; old students simply inherit their village driver.
+            cur_col = await conn.execute("PRAGMA table_info(students)")
+            student_columns = [row[1] for row in await cur_col.fetchall()]
+            if "driver_id" not in student_columns:
+                await conn.execute(
+                    "ALTER TABLE students ADD COLUMN driver_id INTEGER REFERENCES drivers(id) ON DELETE SET NULL"
+                )
 
             await conn.commit()
         finally:
@@ -545,14 +554,35 @@ class Database:
         conn = await self.get_connection()
         try:
             cur = await conn.execute("""
-                SELECT s.*, v.name as village_name, v.school_name, v.zone_id, z.name as zone_name
+                SELECT s.*, v.name as village_name, v.school_name, v.zone_id, z.name as zone_name,
+                       COALESCE(explicit_driver.id, village_driver.id) AS assigned_driver_id,
+                       COALESCE(explicit_driver.full_name, village_driver.full_name) AS assigned_driver_name
                 FROM students s
                 JOIN villages v ON s.village_id = v.id
                 JOIN zones z ON v.zone_id = z.id
+                LEFT JOIN drivers explicit_driver ON s.driver_id = explicit_driver.id AND explicit_driver.is_active = 1
+                LEFT JOIN drivers village_driver ON v.default_driver_id = village_driver.id AND village_driver.is_active = 1
                 WHERE s.id = ?
             """, (student_id,))
             row = await cur.fetchone()
             return dict(row) if row else None
+        finally:
+            await conn.close()
+
+    async def set_student_driver(self, student_id: int, driver_id: Optional[int]) -> bool:
+        """Set an explicit student driver; NULL restores village/automatic assignment."""
+        conn = await self.get_connection()
+        try:
+            if driver_id is not None:
+                cur = await conn.execute("SELECT id FROM drivers WHERE id = ? AND is_active = 1", (driver_id,))
+                if not await cur.fetchone():
+                    return False
+            cur = await conn.execute(
+                "UPDATE students SET driver_id = ? WHERE id = ? AND is_active = 1",
+                (driver_id, student_id),
+            )
+            await conn.commit()
+            return cur.rowcount > 0
         finally:
             await conn.close()
 
@@ -634,12 +664,16 @@ class Database:
             cur = await conn.execute("""
                 SELECT s.id as student_id, s.full_name, s.village_id, s.parent_phone_1, s.parent_phone_2,
                        v.name as village_name, v.zone_id, v.travel_minutes, v.route_order,
-                       v.school_name, v.default_driver_id, z.name as zone_name,
+                       v.school_name,
+                       COALESCE(explicit_driver.id, village_driver.id) AS default_driver_id,
+                       z.name as zone_name,
                        sch.weekday, sch.start_time, sch.end_time
                 FROM schedules sch
                 JOIN students s ON sch.student_id = s.id
                 JOIN villages v ON s.village_id = v.id
                 JOIN zones z ON v.zone_id = z.id
+                LEFT JOIN drivers explicit_driver ON s.driver_id = explicit_driver.id AND explicit_driver.is_active = 1
+                LEFT JOIN drivers village_driver ON v.default_driver_id = village_driver.id AND village_driver.is_active = 1
                 WHERE sch.weekday = ? AND s.is_active = 1
                 ORDER BY sch.start_time ASC, v.route_order ASC
             """, (weekday,))
@@ -661,7 +695,7 @@ class Database:
         try:
             cur = await conn.execute("""
                 SELECT COUNT(*) FROM trips
-                WHERE date = ? AND status IN ('on_way', 'at_center', 'handed_over', 'done')
+                WHERE date = ? AND (approved = 1 OR status IN ('on_way', 'at_center', 'handed_over', 'done'))
             """, (date,))
             row = await cur.fetchone()
             return row[0] > 0
@@ -866,6 +900,27 @@ class Database:
             """, (trip_id, trip["direction"]))
             trip["items"] = [dict(r) for r in await cur_items.fetchall()]
             return trip
+        finally:
+            await conn.close()
+
+    async def assign_driver_to_trip(self, trip_id: int, driver_id: int) -> bool:
+        """Assign an active driver to a trip that has not started yet."""
+        conn = await self.get_connection()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            cur = await conn.execute("SELECT id FROM drivers WHERE id = ? AND is_active = 1", (driver_id,))
+            if not await cur.fetchone():
+                await conn.rollback()
+                return False
+            cur = await conn.execute(
+                "UPDATE trips SET driver_id = ? WHERE id = ? AND status IN ('planned', 'approved')",
+                (driver_id, trip_id),
+            )
+            if cur.rowcount != 1:
+                await conn.rollback()
+                return False
+            await conn.commit()
+            return True
         finally:
             await conn.close()
 
@@ -1433,14 +1488,13 @@ class Database:
     # --- 7-faza: Scheduler, Eslatmalar va Tasdiqlash metodlari ---
     async def check_existing_active_trips(self, date_str: str) -> bool:
         """
-        Qayta hisoblashdan himoya: Agar sanada 'on_way', 'at_center', 'handed_over' yoki 'done'
-        holatidagi reyslar mavjud bo'lsa True qaytaradi.
+        Qayta hisoblashdan himoya: tasdiqlangan, boshlangan yoki yakunlangan reys bo'lsa True.
         """
         conn = await self.get_connection()
         try:
             cur = await conn.execute("""
                 SELECT COUNT(*) FROM trips
-                WHERE date = ? AND status IN ('on_way', 'at_center', 'handed_over', 'done')
+                WHERE date = ? AND (approved = 1 OR status IN ('on_way', 'at_center', 'handed_over', 'done'))
             """, (date_str,))
             row = await cur.fetchone()
             return row[0] > 0
@@ -1457,7 +1511,7 @@ class Database:
             # Serialize plan replacement so concurrent invocations cannot interleave writes.
             await conn.execute("BEGIN IMMEDIATE")
             cur_active = await conn.execute(
-                "SELECT 1 FROM trips WHERE date = ? AND status IN ('on_way', 'at_center', 'handed_over', 'done') LIMIT 1",
+                "SELECT 1 FROM trips WHERE date = ? AND (approved = 1 OR status IN ('on_way', 'at_center', 'handed_over', 'done')) LIMIT 1",
                 (date_str,),
             )
             if await cur_active.fetchone():
