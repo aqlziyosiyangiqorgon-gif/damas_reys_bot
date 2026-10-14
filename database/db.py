@@ -863,6 +863,120 @@ class Database:
         finally:
             await conn.close()
 
+    async def pickup_village_students(
+        self, trip_id: int, village_id: int, driver_id: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Bir mahalladagi barcha kutayotgan (pending) bolalarni birdaniga mashinaga olish.
+        """
+        from datetime import datetime
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn = await self.get_connection()
+        try:
+            # Haydovchini aniqlash (id yoki telegram_id)
+            cur_driver = await conn.execute(
+                "SELECT id, telegram_id FROM drivers WHERE id = ? OR telegram_id = ?",
+                (driver_id, driver_id)
+            )
+            d_row = await cur_driver.fetchone()
+            if not d_row:
+                return []
+            real_driver_id = d_row["id"]
+            actor_tg_id = d_row["telegram_id"] or real_driver_id
+
+            # Reysni tekshirish
+            cur_trip = await conn.execute("SELECT id, driver_id, status FROM trips WHERE id = ?", (trip_id,))
+            trip_row = await cur_trip.fetchone()
+            if not trip_row or trip_row["driver_id"] != real_driver_id:
+                return []
+
+            # Shu mahalladagi barcha pending bolalar
+            cur = await conn.execute("""
+                SELECT ti.id, ti.student_id, ti.trip_id, ti.village_id, ti.status,
+                       s.full_name, s.parent_phone_1 as parent_phone,
+                       v.name as village_name, v.travel_minutes
+                FROM trip_items ti
+                JOIN students s ON ti.student_id = s.id
+                JOIN villages v ON ti.village_id = v.id
+                WHERE ti.trip_id = ? AND ti.village_id = ? AND ti.status = 'pending'
+            """, (trip_id, village_id))
+            items = [dict(r) for r in await cur.fetchall()]
+            if not items:
+                return []
+
+            for it in items:
+                await conn.execute("""
+                    UPDATE trip_items
+                    SET status = 'picked_up', picked_at = ?, actor_id = ?
+                    WHERE id = ?
+                """, (now_str, real_driver_id, it["id"]))
+                await conn.execute("""
+                    INSERT INTO event_log (ts, actor_role, actor_id, action, trip_id, student_id)
+                    VALUES (?, 'driver', ?, 'pickup_student', ?, ?)
+                """, (now_str, actor_tg_id, trip_id, it["student_id"]))
+
+            await conn.commit()
+            return items
+        finally:
+            await conn.close()
+
+    async def dropoff_village_students(
+        self, trip_id: int, village_id: int, driver_id: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Bir mahalladagi barcha yetkazilmagan bolalarni birdaniga uyiga yetkazish.
+        """
+        from datetime import datetime
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn = await self.get_connection()
+        try:
+            # Haydovchini aniqlash (id yoki telegram_id)
+            cur_driver = await conn.execute(
+                "SELECT id, telegram_id FROM drivers WHERE id = ? OR telegram_id = ?",
+                (driver_id, driver_id)
+            )
+            d_row = await cur_driver.fetchone()
+            if not d_row:
+                return []
+            real_driver_id = d_row["id"]
+            actor_tg_id = d_row["telegram_id"] or real_driver_id
+
+            # Reysni tekshirish
+            cur_trip = await conn.execute("SELECT id, driver_id, status FROM trips WHERE id = ?", (trip_id,))
+            trip_row = await cur_trip.fetchone()
+            if not trip_row or trip_row["driver_id"] != real_driver_id:
+                return []
+
+            # Shu mahalladagi barcha hali yetkazilmagan va kelmaydi bo'lmagan bolalar
+            cur = await conn.execute("""
+                SELECT ti.id, ti.student_id, ti.trip_id, ti.village_id, ti.status,
+                       s.full_name, s.parent_phone_1 as parent_phone,
+                       v.name as village_name, v.travel_minutes
+                FROM trip_items ti
+                JOIN students s ON ti.student_id = s.id
+                JOIN villages v ON ti.village_id = v.id
+                WHERE ti.trip_id = ? AND ti.village_id = ? AND ti.status NOT IN ('dropped_off', 'absent')
+            """, (trip_id, village_id))
+            items = [dict(r) for r in await cur.fetchall()]
+            if not items:
+                return []
+
+            for it in items:
+                await conn.execute("""
+                    UPDATE trip_items
+                    SET status = 'dropped_off', dropped_at = ?, actor_id = ?
+                    WHERE id = ?
+                """, (now_str, real_driver_id, it["id"]))
+                await conn.execute("""
+                    INSERT INTO event_log (ts, actor_role, actor_id, action, trip_id, student_id)
+                    VALUES (?, 'driver', ?, 'dropoff_student', ?, ?)
+                """, (now_str, actor_tg_id, trip_id, it["student_id"]))
+
+            await conn.commit()
+            return items
+        finally:
+            await conn.close()
+
     async def get_student_parent_telegram_ids(self, student_id: int) -> List[Dict[str, Any]]:
         conn = await self.get_connection()
         try:

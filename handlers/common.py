@@ -38,10 +38,12 @@ async def cmd_start(message: types.Message, user_role: UserRole, db: Database):
         return
 
     elif user_role == UserRole.DRIVER:
+        from handlers.driver import get_driver_menu_kb
         await message.answer(
             f"🚐 <b>Assalomu alaykum, {message.from_user.first_name}!</b>\n"
             f"Siz tizimda <b>Haydovchi</b> sifatida ro'yxatdansiz.\n\n"
-            f"Reyslaringizni ko'rish uchun: <b>/bugun</b> yoki <b>/mening_reyslarim</b> buyrug'ini bosing.",
+            f"Reyslaringizni ko'rish yoki markaz bilan bog'lanish uchun pastdagi menyudan foydalaning:",
+            reply_markup=get_driver_menu_kb(),
             parse_mode="HTML"
         )
         return
