@@ -45,18 +45,18 @@ def get_admin_menu_kb() -> ReplyKeyboardMarkup:
     """Admin uchun doimiy pastki Reply klaviatura."""
     builder = ReplyKeyboardBuilder()
     builder.row(
+        KeyboardButton(text="📤 O'quvchilar ro'yxatini Excel"),
+        KeyboardButton(text="📥 Excel boshqaruvi")
+    )
+    builder.row(
         KeyboardButton(text="🚐 Bugungi reyslar"),
         KeyboardButton(text="📊 Statistika / Hisobot")
     )
     builder.row(
-        KeyboardButton(text="📥 Excel boshqaruvi"),
-        KeyboardButton(text="📢 Xabar yuborish")
+        KeyboardButton(text="📢 Xabar yuborish"),
+        KeyboardButton(text="👥 Foydalanuvchilar")
     )
-    builder.row(
-        KeyboardButton(text="👥 Foydalanuvchilar"),
-        KeyboardButton(text="🚫 Bugun kelmaganlar")
-    )
-    builder.row(KeyboardButton(text="🧩 Bugungi reyslarni tuzish"))
+    builder.row(KeyboardButton(text="🚫 Bugun kelmaganlar"), KeyboardButton(text="🧩 Bugungi reyslarni tuzish"))
     return builder.as_markup(resize_keyboard=True)
 
 WEEKDAYS_UZ = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"]
@@ -1907,6 +1907,30 @@ async def admin_excel_menu(message: types.Message):
         parse_mode="HTML"
     )
 
+
+async def _send_students_excel(destination, db: Database) -> None:
+    import os
+    from aiogram.types import FSInputFile
+    from services.excel_service import ExcelService
+
+    file_path = await ExcelService.export_students_to_excel(db)
+    try:
+        await destination.answer_document(
+            FSInputFile(file_path, filename="baza_oquvchilar.xlsx"),
+            caption="📤 <b>Baza to'liq Excel formatida eksport qilindi.</b>\n\nBarcha faol o'quvchilar va ularning dars jadvallari mavjud.",
+            parse_mode="HTML"
+        )
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+
+@admin_router.message(F.text == "📤 O'quvchilar ro'yxatini Excel")
+async def admin_export_students_direct(message: types.Message, db: Database):
+    if not is_admin(message.from_user.id):
+        return
+    await _send_students_excel(message, db)
+
 @admin_router.callback_query(F.data == "admin_excel_template")
 async def cb_admin_excel_template(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1935,21 +1959,9 @@ async def cb_admin_excel_export(callback: types.CallbackQuery, db: Database):
     if not is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q!", show_alert=True)
         return
-    import os
-    from aiogram.types import FSInputFile
-    from services.excel_service import ExcelService
 
     await callback.answer("Baza eksport qilinmoqda...")
-    file_path = await ExcelService.export_students_to_excel(db)
-    try:
-        await callback.message.answer_document(
-            FSInputFile(file_path, filename="baza_oquvchilar.xlsx"),
-            caption="📤 <b>Baza to'liq Excel formatida eksport qilindi.</b>\n\nBarcha faol o'quvchilar va ularning dars jadvallari mavjud.",
-            parse_mode="HTML"
-        )
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+    await _send_students_excel(callback.message, db)
 
 @admin_router.callback_query(F.data == "admin_excel_upload_info")
 async def cb_admin_excel_upload_info(callback: types.CallbackQuery):
