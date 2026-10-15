@@ -3,6 +3,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import ErrorEvent
 
 from config import settings
 from database.db import Database
@@ -21,6 +22,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+async def log_dispatcher_error(event: ErrorEvent) -> bool:
+    """Record unhandled update failures without exposing exception/request text."""
+    logger.error(
+        "Unhandled update %s failed (%s)",
+        event.update.update_id,
+        type(event.exception).__name__,
+    )
+    return True
+
+
 async def main():
     db = Database(settings.get_db_path())
     await db.init_db()
@@ -32,6 +44,7 @@ async def main():
     )
     fsm_storage = SQLiteFSMStorage(db)
     dp = Dispatcher(storage=fsm_storage)
+    dp.errors.register(log_dispatcher_error)
 
     # Dependency Injection
     dp["db"] = db

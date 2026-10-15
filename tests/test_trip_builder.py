@@ -34,10 +34,10 @@ def test_single_student_to_center_and_to_home():
     trips, warnings = builder.generate_trips_for_day(schedules)
     assert len(trips) == 2
 
-    # to_center: planned_time = 09:00 (540m) - 30m - 35m - (1 stop * 2m) = 473m = 07:53
+    # to_center: planned_time = 09:00 (540m) - 35m - 2m dwell - 5m buffer = 498m = 08:18
     to_center_trip = trips[0]
     assert to_center_trip["direction"] == "to_center"
-    assert to_center_trip["planned_time"] == "07:53"
+    assert to_center_trip["planned_time"] == "08:18"
     assert to_center_trip["zone_id"] == 1
     assert len(to_center_trip["items"]) == 1
     assert to_center_trip["items"][0]["student_id"] == 1
@@ -146,8 +146,8 @@ def test_pickup_reverse_route_order():
     # max(travel_minutes) = 35m (Arpaariq)
     # to'xtashlar_soni = 3 ta unikal qishloq
     # dwell = 3 * 2 = 6m
-    # planned_time = 540 - 30 - 35 - 6 = 469m = 07:49
-    assert to_center["planned_time"] == "07:49"
+    # planned_time = 540 - 35 - 6 - 5 = 494m = 08:14
+    assert to_center["planned_time"] == "08:14"
 
     # to_home da route_order DESC (3, 2, 1)
     to_home = trips[1]
@@ -275,6 +275,117 @@ def test_max_wait_min_split():
     center_trips = [t for t in trips if t["direction"] == "to_center"]
     assert len(center_trips) == 2
     assert center_trips[0]["planned_time"] != center_trips[1]["planned_time"]
+
+
+def test_to_center_arrives_five_minutes_before_first_lesson():
+    builder = TripBuilder(
+        stop_dwell_min=2,
+        max_wait_min=30,
+        route_buffer_min=5,
+    )
+    schedules = [{
+        "student_id": 1,
+        "full_name": "Ali Valiyev",
+        "village_id": 1,
+        "zone_id": 1,
+        "route_order": 1,
+        "travel_minutes": 25,
+        "start_time": "09:00",
+        "end_time": "11:00",
+    }]
+
+    trips, _ = builder.generate_trips_for_day(schedules)
+    to_center = next(trip for trip in trips if trip["direction"] == "to_center")
+
+    assert to_center["planned_time"] == "08:28"
+    arrival_at_center = 8 * 60 + 28 + 25 + 2
+    assert arrival_at_center == 8 * 60 + 55
+    assert 9 * 60 - arrival_at_center == 5
+
+
+def test_to_center_wait_rule_keeps_0925_but_splits_0930():
+    builder = TripBuilder(
+        capacity=9,
+        group_window_min=30,
+        max_wait_min=30,
+        route_buffer_min=5,
+    )
+    schedules = [
+        {
+            "student_id": 1,
+            "full_name": "Erta Bola",
+            "village_id": 1,
+            "zone_id": 1,
+            "route_order": 1,
+            "travel_minutes": 25,
+            "start_time": "09:00",
+            "end_time": "11:00",
+        },
+        {
+            "student_id": 2,
+            "full_name": "Chegara Bola",
+            "village_id": 1,
+            "zone_id": 1,
+            "route_order": 1,
+            "travel_minutes": 25,
+            "start_time": "09:25",
+            "end_time": "11:25",
+        },
+        {
+            "student_id": 3,
+            "full_name": "Kech Bola",
+            "village_id": 1,
+            "zone_id": 1,
+            "route_order": 1,
+            "travel_minutes": 25,
+            "start_time": "09:30",
+            "end_time": "11:30",
+        },
+    ]
+
+    trips, _ = builder.generate_trips_for_day(schedules)
+    center_trips = [trip for trip in trips if trip["direction"] == "to_center"]
+
+    trip_for_first_two = next(trip for trip in center_trips if 1 in [item["student_id"] for item in trip["items"]])
+    assert {item["student_id"] for item in trip_for_first_two["items"]} == {1, 2}
+    trip_for_0930 = next(trip for trip in center_trips if 3 in [item["student_id"] for item in trip["items"]])
+    assert {item["student_id"] for item in trip_for_0930["items"]} == {3}
+
+
+def test_to_center_student_40_minutes_later_is_never_in_same_trip():
+    builder = TripBuilder(
+        group_window_min=60,
+        max_wait_min=30,
+        route_buffer_min=5,
+    )
+    schedules = [
+        {
+            "student_id": 1,
+            "full_name": "Erta Bola",
+            "village_id": 1,
+            "zone_id": 1,
+            "route_order": 1,
+            "travel_minutes": 25,
+            "start_time": "09:00",
+            "end_time": "11:00",
+        },
+        {
+            "student_id": 2,
+            "full_name": "Kech Bola",
+            "village_id": 1,
+            "zone_id": 1,
+            "route_order": 1,
+            "travel_minutes": 25,
+            "start_time": "09:40",
+            "end_time": "11:40",
+        },
+    ]
+
+    trips, _ = builder.generate_trips_for_day(schedules)
+    center_trips = [trip for trip in trips if trip["direction"] == "to_center"]
+
+    assert len(center_trips) == 2
+    assert all(len(trip["items"]) == 1 for trip in center_trips)
 
 
 def test_min_gap_warning():

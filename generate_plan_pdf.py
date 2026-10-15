@@ -148,7 +148,7 @@ def build_pdf(filename):
 
     # Meta Table
     meta_data = [
-        [Paragraph("<b>Texnologiyalar:</b> Python 3.11, aiogram 3, aiosqlite, APScheduler, pandas", body_style),
+        [Paragraph("<b>Texnologiyalar:</b> Python >=3.11, aiogram 3, aiosqlite, APScheduler, openpyxl", body_style),
          Paragraph("<b>Holati:</b> Tasdiqlangan / Bosqichli ijro", body_style)],
         [Paragraph("<b>Vaqt zonasi:</b> Asia/Tashkent (UTC+5)", body_style),
          Paragraph("<b>Deploy:</b> Railway (Worker service)", body_style)]
@@ -215,7 +215,7 @@ def build_pdf(filename):
             "points": [
                 "<b>Jadvallar:</b> villages (7 ta qishloq), students, schedules, trips, trip_items.",
                 "<b>Ulanish usuli:</b> Har bir operatsiya uchun mustaqil async with aiosqlite.connect(...) as conn context manageri qo'llanadi (Windowsda fayl bloklanishining oldini oladi).",
-                "<b>Xavfsiz qayta hisoblash:</b> save_planned_trips metodida has_active_trips tekshiruvi bo'ladi; agar sanada on_way yoki done reyslar bo'lsa, ma'lumotlar o'chirilmaydi va rad etiladi.",
+                "<b>Xavfsiz qayta hisoblash:</b> save_generated_trips tranzaksiyada faol reyslarni tekshiradi; agar sanada tasdiqlangan, yo'lda yoki yakunlangan reyslar bo'lsa, ma'lumotlar o'chirilmaydi va qayta hisoblash rad etiladi.",
                 "<b>Dinamik tartiblash:</b> get_trips_by_date da pickup reyslariga route_order DESC (uzoqdan markazga), dropoff reyslariga route_order ASC (markazdan uzoqqa) saralash beriladi."
             ],
             "result": "Baza avtomatik ochiladi, migratsiyalar bajariladi va 7 ta qishloq standart kiritiladi."
@@ -282,7 +282,7 @@ def build_pdf(filename):
                 "<b>/ota_ona:</b> Kontakt yuborish tugmasi orqali telefon raqam bazadagi o'quvchiga avtomatik bog'lanadi.",
                 "<b>Tezkor bildirishnoma:</b> Haydovchi tugmani bosishi bilan ota-onaga farzandining mashinaga o'tirgani yoki yetkazilgani haqida xabar keladi.",
                 "<b>/shablon:</b> Bo'sh Excel shablonini generatsiya qilib beradi.",
-                "<b>Excel yuklash:</b> .xlsx fayl yuborilganda pandas orqali o'qilib, barcha o'quvchilar va ularning jadvallari bir zumda bazaga yoziladi."
+                "<b>Excel yuklash:</b> .xlsx fayl openpyxl orqali o'qilib, o'quvchilar va ularning jadvallari bazaga kiritiladi."
             ],
             "result": "Ota-onalarda xotirjamlik, markaz ma'muriyatida esa qog'ozbozlikdan to'liq qutilish."
         },

@@ -4,7 +4,7 @@ O'quvchilarni Damas transportida markazga olib kelish va uyiga qaytarishni rejal
 
 ## Texnologiyalar
 
-- Python 3.11+
+- Python >=3.11 (StrEnum uchun)
 - aiogram 3.15, aiosqlite va SQLite (WAL)
 - APScheduler 3.10; rejalashtirilgan vaqtlar `Asia/Tashkent` bo'yicha
 - openpyxl (Excel import va eksport)

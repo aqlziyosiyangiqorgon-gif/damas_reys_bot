@@ -1,6 +1,7 @@
 import pytest
 import os
 import uuid
+from html import unescape
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 from aiogram.types import CallbackQuery, User, Message
@@ -145,10 +146,11 @@ async def test_parent_cabinet_and_fsm_absence():
         assert mock_state_data["absent_student_id"] == st1_id
         mock_state.set_state.assert_called_with(ParentStates.waiting_for_absence_reason)
 
-        # 7.3 Ota izoh yozadi: "Shamollab qoldi"
+        # 7.3 Ota izoh yozadi: HTML belgilar literal matn bo'lib ko'rinishi kerak
+        reason_text = "<b>Shamollab</b> & shifokorga olib boramiz"
         msg_reason = MagicMock(spec=Message)
         msg_reason.from_user = User(id=parent_tg_id, is_bot=False, first_name="Ota")
-        msg_reason.text = "Shamollab qoldi, shifokorga olib boramiz"
+        msg_reason.text = reason_text
         msg_reason.bot = mock_bot
         msg_reason.answer = AsyncMock()
 
@@ -162,7 +164,7 @@ async def test_parent_cabinet_and_fsm_absence():
         cur_a = await conn.execute("SELECT * FROM absences WHERE student_id = ? AND date = ?", (st1_id, today_str))
         a_row = await cur_a.fetchone()
         assert a_row is not None
-        assert a_row["reason"] == "Shamollab qoldi, shifokorga olib boramiz"
+        assert a_row["reason"] == reason_text
 
         # trip_items holati absent bo'lganini tekshirish
         cur_ti = await conn.execute("SELECT status FROM trip_items WHERE id = ?", (item1_id,))
@@ -172,7 +174,7 @@ async def test_parent_cabinet_and_fsm_absence():
         # Haydovchiga xabar borganini tekshirish (izoh bilan)
         mock_bot.send_message.assert_any_call(
             chat_id=driver_tg_id,
-            text=f"ℹ️ <b>Ali Aliyev</b> (Arpaariq) bugun kelmaydi deb belgilandi.\n💬 <b>Sababi:</b> Shamollab qoldi, shifokorga olib boramiz",
+            text=f"ℹ️ <b>Ali Aliyev</b> (Arpaariq) bugun kelmaydi deb belgilandi.\n💬 <b>Sababi:</b> &lt;b&gt;Shamollab&lt;/b&gt; &amp; shifokorga olib boramiz",
             parse_mode="HTML"
         )
 
@@ -182,7 +184,10 @@ async def test_parent_cabinet_and_fsm_absence():
             if call[1].get("chat_id") == admin_tg_id and "Kelmaslik xabarnomasi" in call[1].get("text", ""):
                 admin_call_found = True
                 assert "Ali Aliyev" in call[1]["text"]
-                assert "Shamollab qoldi" in call[1]["text"]
+                encoded_reason = "&lt;b&gt;Shamollab&lt;/b&gt; &amp; shifokorga olib boramiz"
+                assert encoded_reason in call[1]["text"]
+                assert unescape(encoded_reason) == reason_text
+                assert call[1]["parse_mode"] == "HTML"
         assert admin_call_found, "Adminga kelmaslik xabarnomasi bormadi!"
 
         # =============================================================
@@ -204,3 +209,64 @@ async def test_parent_cabinet_and_fsm_absence():
                 os.remove(test_db)
             except Exception:
                 pass
+
+
+@pytest.mark.asyncio
+async def test_parent_status_prefers_active_to_center_trip_over_pending_home_trip():
+    test_db = f"test_parent_status_{uuid.uuid4().hex[:8]}.db"
+    db = Database(test_db)
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    try:
+        await db.init_db()
+        conn = await db.get_connection()
+        cur = await conn.execute("INSERT INTO zones (name) VALUES ('Test zona')")
+        zone_id = cur.lastrowid
+        cur = await conn.execute(
+            "INSERT INTO villages (name, zone_id, travel_minutes, route_order) VALUES ('Test mahalla', ?, 10, 1)",
+            (zone_id,),
+        )
+        village_id = cur.lastrowid
+        await conn.commit()
+        await conn.close()
+
+        student_id = await db.add_student("Test o'quvchi", village_id, "901234567")
+        conn = await db.get_connection()
+        cur = await conn.execute(
+            "INSERT INTO trips (date, direction, planned_time, status) VALUES (?, 'to_center', '08:00', 'on_way')",
+            (today,),
+        )
+        center_trip_id = cur.lastrowid
+        await conn.execute(
+            "INSERT INTO trip_items (trip_id, student_id, village_id, status) VALUES (?, ?, ?, 'picked_up')",
+            (center_trip_id, student_id, village_id),
+        )
+        cur = await conn.execute(
+            "INSERT INTO trips (date, direction, planned_time, status) VALUES (?, 'to_home', '17:00', 'planned')",
+            (today,),
+        )
+        home_trip_id = cur.lastrowid
+        await conn.execute(
+            "INSERT INTO trip_items (trip_id, student_id, village_id, status) VALUES (?, ?, ?, 'pending')",
+            (home_trip_id, student_id, village_id),
+        )
+        await conn.commit()
+        await conn.close()
+
+        current = await db.get_student_current_status(student_id, today)
+
+        assert current["trip"]["trip_id"] == center_trip_id
+        assert current["status_code"] == "picked_up"
+        assert current["status_text"] == "Mashinada"
+
+        conn = await db.get_connection()
+        await conn.execute("UPDATE trips SET status = 'at_center' WHERE id = ?", (center_trip_id,))
+        await conn.commit()
+        await conn.close()
+        arrived = await db.get_student_current_status(student_id, today)
+        assert arrived["status_text"] == "Markazga yetib kelgan"
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            path = test_db + suffix
+            if os.path.exists(path):
+                os.remove(path)

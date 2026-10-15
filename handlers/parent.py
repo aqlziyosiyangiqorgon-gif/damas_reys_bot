@@ -1,9 +1,14 @@
-from utils.time import now_tashkent
+from utils.clock import now_tz
 from datetime import datetime
-from typing import Optional, List
 from aiogram import Router, types, F
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
+from models.callbacks import (
+    AbsentButtonCallback,
+    AbsentSelectCallback,
+    ConfirmChildCallback,
+    RejectChildCallback,
+)
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     ReplyKeyboardMarkup,
@@ -17,8 +22,7 @@ from config import settings
 from database.db import Database, normalize_phone
 from models.enums import UserRole
 from utils.text import escape_html
-from utils.telegram import safe_telegram_call
-from utils.start_banner import answer_start
+from services.telegram_safe import safe_send
 
 parent_router = Router()
 
@@ -33,6 +37,11 @@ async def _is_own_child(db: Database, tg_id: int, student_id: int) -> bool:
     if not parent:
         return False
     return await db.is_student_linked_to_parent(student_id, parent["id"])
+
+
+async def _clear_absence_reason_state(state: FSMContext | None) -> None:
+    if state and await state.get_state() == ParentStates.waiting_for_absence_reason.state:
+        await state.clear()
 
 def get_contact_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -50,30 +59,6 @@ def get_parent_menu_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📅 Dars jadvali"), KeyboardButton(text="📞 Markaz bilan aloqa")]
         ],
         resize_keyboard=True
-    )
-
-async def parent_start(message: types.Message, db: Database, user_role: UserRole):
-    # Agar allaqachon ota-ona sifatida ro'yxatdan o'tgan bo'lsa
-    if user_role == UserRole.PARENT:
-        parent = await db.get_parent_by_telegram_id(message.from_user.id)
-        if parent:
-            students = await db.get_parent_students(parent["id"])
-            if students:
-                await answer_start(
-                    message,
-                    "👨‍👩‍👧‍👦 <b>AQL ZIYOSI</b> ota-ona kabinetiga xush kelibsiz!",
-                    reply_markup=get_parent_menu_kb()
-                )
-                await show_parent_dashboard(message, students, db)
-                return
-
-    # Ro'yxatdan o'tmagan (GUEST) bo'lsa telefon raqamini so'rash
-    await answer_start(
-        message,
-        "Assalomu alaykum! <b>AQL ZIYOSI</b> o'quvchilar transport botiga xush kelibsiz.\n\n"
-        "Farzandingizning qatnovini real vaqtda kuzatish uchun iltimos, "
-        "quyidagi tugma orqali <b>telefon raqamingizni yuboring</b>:",
-        reply_markup=get_contact_keyboard()
     )
 
 # --- 2. Kontakt qabul qilish va tekshirish ---
@@ -107,7 +92,7 @@ async def process_parent_contact(message: types.Message, db: Database):
         return
 
     # Ota-onani bazaga saqlash
-    now_str = now_tashkent().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = now_tz().strftime("%Y-%m-%d %H:%M:%S")
     parent_id = await db.add_parent(message.from_user.id, norm_phone, now_str)
 
     await message.answer(
@@ -124,8 +109,8 @@ async def process_parent_contact(message: types.Message, db: Database):
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Ha", callback_data=f"confirm_ch:{st['id']}:{parent_id}"),
-                InlineKeyboardButton(text="❌ Yo'q", callback_data=f"reject_ch:{st['id']}:{parent_id}")
+                InlineKeyboardButton(text="✅ Ha", callback_data=ConfirmChildCallback(student_id=st["id"], parent_id=parent_id).pack()),
+                InlineKeyboardButton(text="❌ Yo'q", callback_data=RejectChildCallback(student_id=st["id"], parent_id=parent_id).pack())
             ]
         ])
         await message.answer(
@@ -135,11 +120,11 @@ async def process_parent_contact(message: types.Message, db: Database):
         )
 
 # --- 3. Farzandni tasdiqlash callbacki ---
-@parent_router.callback_query(F.data.startswith("confirm_ch:"))
-async def cb_confirm_child(callback: types.CallbackQuery, db: Database):
-    parts = callback.data.split(":")
-    student_id = int(parts[1])
-    parent_id = int(parts[2])
+@parent_router.callback_query(ConfirmChildCallback.filter())
+async def cb_confirm_child(callback: types.CallbackQuery, db: Database, callback_data: ConfirmChildCallback | None = None):
+    callback_data = callback_data or ConfirmChildCallback.unpack(callback.data)
+    student_id = callback_data.student_id
+    parent_id = callback_data.parent_id
 
     parent = await db.get_parent_by_telegram_id(callback.from_user.id)
     if not parent or parent["id"] != parent_id:
@@ -179,11 +164,11 @@ async def cb_confirm_child(callback: types.CallbackQuery, db: Database):
     await callback.answer("Tasdiqlandi!")
 
 # --- 4. Farzandni rad etish callbacki ---
-@parent_router.callback_query(F.data.startswith("reject_ch:"))
-async def cb_reject_child(callback: types.CallbackQuery, db: Database):
-    parts = callback.data.split(":")
-    student_id = int(parts[1])
-    parent_id = int(parts[2])
+@parent_router.callback_query(RejectChildCallback.filter())
+async def cb_reject_child(callback: types.CallbackQuery, db: Database, callback_data: RejectChildCallback | None = None):
+    callback_data = callback_data or RejectChildCallback.unpack(callback.data)
+    student_id = callback_data.student_id
+    parent_id = callback_data.parent_id
 
     parent = await db.get_parent_by_telegram_id(callback.from_user.id)
     if not parent or parent["id"] != parent_id:
@@ -240,7 +225,7 @@ async def show_parent_dashboard(message: types.Message, students: list, db: Data
 
     rows = []
     for s in students:
-        rows.append([InlineKeyboardButton(text=f"🚫 {s['full_name']} bugun kelmaydi", callback_data=f"absent_btn:{s['id']}")])
+        rows.append([InlineKeyboardButton(text=f"🚫 {s['full_name']} bugun kelmaydi", callback_data=AbsentButtonCallback(student_id=s["id"]).pack())])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
 
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
@@ -249,7 +234,8 @@ async def show_parent_dashboard(message: types.Message, students: list, db: Data
 
 # a) 📍 Farzandim qayerda?
 @parent_router.message(F.text == "📍 Farzandim qayerda?")
-async def parent_track_children(message: types.Message, db: Database):
+async def parent_track_children(message: types.Message, db: Database, state: FSMContext | None = None):
+    await _clear_absence_reason_state(state)
     parent = await db.get_parent_by_telegram_id(message.from_user.id)
     if not parent:
         await message.answer("Siz hali ota-ona sifatida ro'yxatdan o'tmagansiz. /start ni bosing.")
@@ -260,7 +246,7 @@ async def parent_track_children(message: types.Message, db: Database):
         await message.answer("Sizga biriktirilgan farzandlar topilmadi.", reply_markup=get_parent_menu_kb())
         return
 
-    date_str = now_tashkent().strftime("%Y-%m-%d")
+    date_str = now_tz().strftime("%Y-%m-%d")
     text = "📍 <b>Farzandingizning hozirgi holati:</b>\n\n"
 
     for s in students:
@@ -284,7 +270,8 @@ async def parent_track_children(message: types.Message, db: Database):
 
 # b) 📅 Dars jadvali
 @parent_router.message(F.text == "📅 Dars jadvali")
-async def parent_view_schedule(message: types.Message, db: Database):
+async def parent_view_schedule(message: types.Message, db: Database, state: FSMContext | None = None):
+    await _clear_absence_reason_state(state)
     parent = await db.get_parent_by_telegram_id(message.from_user.id)
     if not parent:
         await message.answer("Siz hali ota-ona sifatida ro'yxatdan o'tmagansiz. /start ni bosing.")
@@ -299,7 +286,8 @@ async def parent_view_schedule(message: types.Message, db: Database):
 
 # c) 📞 Markaz bilan aloqa
 @parent_router.message(F.text == "📞 Markaz bilan aloqa")
-async def parent_center_contact(message: types.Message):
+async def parent_center_contact(message: types.Message, state: FSMContext | None = None):
+    await _clear_absence_reason_state(state)
     await message.answer(
         "📞 <b>AQL ZIYOSI o'quv markazi ma'muriyati:</b>\n\n"
         "Telefon: <b>+998 77 260 20 20</b>\n\n"
@@ -311,6 +299,7 @@ async def parent_center_contact(message: types.Message):
 # d) 🚫 Bugun kelmaydi (Reply menu orqali FSM boshlash)
 @parent_router.message(F.text == "🚫 Bugun kelmaydi")
 async def parent_report_absence_start(message: types.Message, state: FSMContext, db: Database):
+    await _clear_absence_reason_state(state)
     parent = await db.get_parent_by_telegram_id(message.from_user.id)
     if not parent:
         await message.answer("Siz hali ota-ona sifatida ro'yxatdan o'tmagansiz. /start ni bosing.")
@@ -333,16 +322,17 @@ async def parent_report_absence_start(message: types.Message, state: FSMContext,
     else:
         rows = []
         for st in students:
-            rows.append([InlineKeyboardButton(text=f"🚫 {st['full_name']}", callback_data=f"absent_select:{st['id']}")])
+            rows.append([InlineKeyboardButton(text=f"🚫 {st['full_name']}", callback_data=AbsentSelectCallback(student_id=st["id"]).pack())])
         rows.append([InlineKeyboardButton(text="❌ Bekor qilish", callback_data="absent_cancel")])
         await message.answer(
             "Qaysi farzandingiz bugun darsga kelmaydi?",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
         )
 
-@parent_router.callback_query(F.data.startswith("absent_select:"))
-async def cb_absent_select(callback: types.CallbackQuery, state: FSMContext, db: Database):
-    student_id = int(callback.data.split(":")[1])
+@parent_router.callback_query(AbsentSelectCallback.filter())
+async def cb_absent_select(callback: types.CallbackQuery, state: FSMContext, db: Database, callback_data: AbsentSelectCallback | None = None):
+    callback_data = callback_data or AbsentSelectCallback.unpack(callback.data)
+    student_id = callback_data.student_id
     if not await _is_own_child(db, callback.from_user.id, student_id):
         await callback.answer("Bu sizning farzandingiz emas!", show_alert=True)
         return
@@ -379,7 +369,7 @@ async def process_absence_reason(message: types.Message, state: FSMContext, db: 
         return
 
     reason = message.text.strip()[:100]
-    date_str = now_tashkent().strftime("%Y-%m-%d")
+    date_str = now_tz().strftime("%Y-%m-%d")
 
     success, err_code, info = await db.mark_student_absent_with_reason(
         student_id=student_id,
@@ -421,10 +411,10 @@ async def process_absence_reason(message: types.Message, state: FSMContext, db: 
 
     # 2. Haydovchiga xabar (agar reys va haydovchi bo'lsa)
     if info.get("driver_tg_id") and message.bot:
-        await safe_telegram_call(
-            message.bot.send_message,
-            chat_id=info["driver_tg_id"],
-            text=f"ℹ️ <b>{escape_html(st_name)}</b> ({escape_html(v_name)}) bugun kelmaydi deb belgilandi.\n💬 <b>Sababi:</b> {escape_html(reason)}",
+        await safe_send(
+            message.bot,
+            info["driver_tg_id"],
+            f"ℹ️ <b>{escape_html(st_name)}</b> ({escape_html(v_name)}) bugun kelmaydi deb belgilandi.\n💬 <b>Sababi:</b> {escape_html(reason)}",
             parse_mode="HTML",
         )
 
@@ -438,23 +428,24 @@ async def process_absence_reason(message: types.Message, state: FSMContext, db: 
     )
     if message.bot:
         for admin_id in settings.admin_ids_list:
-            await safe_telegram_call(message.bot.send_message, chat_id=admin_id, text=admin_text, parse_mode="HTML")
+            await safe_send(message.bot, admin_id, admin_text, parse_mode="HTML")
 
 # --- 8. Mavjud inline tugma orqali kelmaslikni belgilash (Phase 8 test mosligi) ---
-@parent_router.callback_query(F.data.startswith("absent_btn:"))
-async def cb_student_absent(callback: types.CallbackQuery, db: Database):
+@parent_router.callback_query(AbsentButtonCallback.filter())
+async def cb_student_absent(callback: types.CallbackQuery, db: Database, callback_data: AbsentButtonCallback | None = None):
+    callback_data = callback_data or AbsentButtonCallback.unpack(callback.data)
     parent = await db.get_parent_by_telegram_id(callback.from_user.id)
     if not parent:
         await callback.answer("Faqat ro'yxatdan o'tgan ota-onalar uchun!", show_alert=True)
         return
 
-    student_id = int(callback.data.split(":")[1])
+    student_id = callback_data.student_id
     is_linked = await db.is_student_linked_to_parent(student_id, parent["id"])
     if not is_linked:
         await callback.answer("Bu sizning farzandingiz emas!", show_alert=True)
         return
 
-    date_str = now_tashkent().strftime("%Y-%m-%d")
+    date_str = now_tz().strftime("%Y-%m-%d")
     success, reason, info = await db.mark_student_absent(
         student_id=student_id,
         date_str=date_str,
@@ -473,10 +464,10 @@ async def cb_student_absent(callback: types.CallbackQuery, db: Database):
 
     # Haydovchiga darhol xabar yuborish
     if info and info.get("driver_tg_id") and callback.bot:
-        await safe_telegram_call(
-            callback.bot.send_message,
-            chat_id=info["driver_tg_id"],
-            text=f"ℹ️ <b>{escape_html(info['student_name'])}</b> ({escape_html(info['village_name'])}) bugun kelmaydi deb belgilandi.",
+        await safe_send(
+            callback.bot,
+            info["driver_tg_id"],
+            f"ℹ️ <b>{escape_html(info['student_name'])}</b> ({escape_html(info['village_name'])}) bugun kelmaydi deb belgilandi.",
             parse_mode="HTML",
         )
 

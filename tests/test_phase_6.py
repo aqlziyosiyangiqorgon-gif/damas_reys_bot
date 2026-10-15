@@ -256,3 +256,47 @@ async def test_phase_6_staff_flow():
     finally:
         if os.path.exists(test_db):
             os.remove(test_db)
+
+
+@pytest.mark.asyncio
+async def test_handover_does_not_regress_on_way_trip(tmp_path):
+    db = Database(str(tmp_path / "handover_on_way.db"))
+    await db.init_db()
+
+    staff_id = await db.add_staff(
+        telegram_id=88880001,
+        full_name="Oila xodimi",
+        phone="+998908888001",
+    )
+    driver_id = await db.add_driver(
+        telegram_id=66660001,
+        full_name="Haydovchi",
+        phone="+998906666001",
+    )
+    student_id = await db.add_student(
+        "Sinov o'quvchisi",
+        village_id=1,
+        parent_phone_1="+998901112233",
+    )
+
+    conn = await db.get_connection()
+    trip_cur = await conn.execute("""
+        INSERT INTO trips (date, direction, driver_id, planned_time, status, approved)
+        VALUES ('2026-10-21', 'to_home', ?, '13:00', 'on_way', 1)
+    """, (driver_id,))
+    trip_id = trip_cur.lastrowid
+    item_cur = await conn.execute("""
+        INSERT INTO trip_items (trip_id, student_id, village_id, status)
+        VALUES (?, ?, 1, 'pending')
+    """, (trip_id, student_id))
+    item_id = item_cur.lastrowid
+    await conn.commit()
+    await conn.close()
+
+    result = await db.handover_student(item_id, staff_id)
+
+    assert result[1] == "success"
+    trip = await db.get_trip_details(trip_id)
+    item = await db.get_trip_item_by_id(item_id)
+    assert trip["status"] == "on_way"
+    assert item["status"] == "handed_over"

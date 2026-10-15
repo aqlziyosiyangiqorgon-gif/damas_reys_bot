@@ -1,6 +1,6 @@
 from aiogram import Router, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.fsm.context import FSMContext
 from models.enums import UserRole
 from database.db import Database
 from utils.text import escape_html
@@ -13,21 +13,41 @@ common_router = Router()
 async def cmd_my_id(message: types.Message):
     await message.answer(f"Telegram ID: <code>{message.from_user.id}</code>")
 
-def get_admin_menu_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🚐 Bugungi reyslar"), KeyboardButton(text="📊 Statistika / Hisobot")],
-            [KeyboardButton(text="📥 Excel boshqaruvi"), KeyboardButton(text="📢 Xabar yuborish")],
-            [KeyboardButton(text="👥 Foydalanuvchilar"), KeyboardButton(text="🚫 Bugun kelmaganlar")],
-            [KeyboardButton(text="🧩 Bugungi reyslarni tuzish")]
-        ],
-        resize_keyboard=True
-    )
+
+@common_router.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext, user_role: UserRole):
+    """Cancel the current conversation and return the user's role menu."""
+    await state.clear()
+
+    if user_role == UserRole.ADMIN:
+        from handlers.admin import get_admin_menu_kb
+        keyboard = get_admin_menu_kb()
+        label = "Admin menyusi"
+    elif user_role == UserRole.DRIVER:
+        from handlers.driver import get_driver_menu_kb
+        keyboard = get_driver_menu_kb()
+        label = "Haydovchi menyusi"
+    elif user_role == UserRole.STAFF:
+        from handlers.staff import get_staff_menu_kb
+        keyboard = get_staff_menu_kb()
+        label = "Xodim menyusi"
+    elif user_role == UserRole.PARENT:
+        from handlers.parent import get_parent_menu_kb
+        keyboard = get_parent_menu_kb()
+        label = "Ota-ona menyusi"
+    else:
+        from handlers.parent import get_contact_keyboard
+        keyboard = get_contact_keyboard()
+        label = "Ro'yxatdan o'tish"
+
+    await message.answer(f"✅ Joriy amal bekor qilindi. {label}:", reply_markup=keyboard)
 
 @common_router.message(CommandStart())
 @common_router.message(Command("admin"))
 async def cmd_start(message: types.Message, user_role: UserRole, db: Database):
     if user_role == UserRole.ADMIN:
+        from handlers.admin import get_admin_menu_kb
+
         text = (
             f"👑 <b>Assalomu alaykum, {escape_html(message.from_user.first_name)}!</b>\n"
             f"<b>AQL ZIYOSI</b> transport tizimi <b>Admin boshqaruv paneliga</b> xush kelibsiz.\n\n"

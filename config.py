@@ -1,4 +1,5 @@
 import os
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
 
@@ -29,13 +30,14 @@ def get_default_backup_dir() -> str:
 
 class Settings(BaseSettings):
     BOT_TOKEN: str = "YOUR_BOT_TOKEN_HERE"
-    ADMIN_IDS: str = "6273865667,7446734373"
+    ADMIN_IDS: str = ""
     
     # Standart sozlamalar
     CAPACITY: int = 9
     GROUP_WINDOW_MIN: int = 20
     MIN_GAP_BETWEEN_TRIPS_MIN: int = 40
     PICKUP_LEAD_MIN: int = 30
+    ROUTE_BUFFER_MIN: int = 5
     STOP_DWELL_MIN: int = 2          # Har bir to'xtashga qo'shiladigan vaqt (daqiqa)
     MAX_WAIT_MIN: int = 30           # Markazda dars boshlanishini kutish maksimal vaqti
     
@@ -47,6 +49,14 @@ class Settings(BaseSettings):
     DB_PATH: str = get_default_db_path()
     BACKUP_DIR: str = get_default_backup_dir()
     BACKUP_RETENTION_DAYS: int = 7
+    BACKUP_CHAT_ID: int | None = None
+
+    @field_validator("BACKUP_CHAT_ID", mode="before")
+    @classmethod
+    def parse_optional_backup_chat_id(cls, value):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        return int(value)
 
     model_config = SettingsConfigDict(
         env_file=os.path.join(BASE_DIR, ".env"), env_file_encoding="utf-8", extra="ignore"

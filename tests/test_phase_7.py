@@ -9,9 +9,11 @@ from database.db import Database
 from services.scheduler_service import SchedulerService
 from handlers.admin import cb_admin_approve_trips
 from models.enums import TripStatus, TripDirection
+from config import settings
 
 @pytest.mark.asyncio
-async def test_phase_7_scheduler_and_escalation():
+async def test_phase_7_scheduler_and_escalation(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "ADMIN_IDS", "6273865667")
     test_db = f"test_phase7_{uuid.uuid4().hex[:8]}.db"
     db = Database(test_db)
 
@@ -109,6 +111,18 @@ async def test_phase_7_scheduler_and_escalation():
         await conn.commit()
         await conn.close()
 
+        parent_tg_id = 99118822
+        parent_id = await db.add_parent(parent_tg_id, "+998901112233")
+        await db.link_student_parent(st1_id, parent_id)
+        monkeypatch.setattr(settings, "ADMIN_IDS", str(admin_tg_id))
+        mock_bot.send_message.reset_mock()
+
+        def assert_exact_message(chat_id, text):
+            assert any(
+                call.kwargs.get("chat_id") == chat_id and call.kwargs.get("text") == text
+                for call in mock_bot.send_message.await_args_list
+            ), f"chat_id={chat_id} uchun kutilgan xabar topilmadi: {text!r}"
+
         # A) 07:15 (45 daqiqa oldin) -> Hech qanday eslatma ketmasligi kerak
         t_0715 = datetime(2026, 10, 21, 7, 15, 0)
         res_0715 = await scheduler.check_and_send_reminders(now_dt=t_0715)
@@ -128,7 +142,22 @@ async def test_phase_7_scheduler_and_escalation():
         assert t_check2["reminder_count"] == 1
         assert t_check2["last_reminder_at"] == "2026-10-21 07:30:00"
 
-        # C) 07:35 (1-eslatmadan 5 daqiqa o'tdi) -> Hali 10 daqiqa bo'lmadi, eslatma yo'q
+        assert_exact_message(
+            driver_tg_id,
+            f"⏰ <b>1-eslatma: Reys vaqti yaqinlashmoqda!</b>\n\n"
+            f"🚐 <b>Reys #{test_trip_id}</b> (Markazga kelish)\n"
+            "⏱ Rejalashtirilgan vaqt: <b>08:00</b>\n"
+            "👥 O'quvchilar ro'yxati:\n  1. Temur Aliyev — Arpaariq\n\n"
+            "Iltimos, harakatni boshlash uchun [🚗 Yo'ldaman] tugmasini bosing:",
+        )
+        assert_exact_message(
+            parent_tg_id,
+            "⏰ <b>1-eslatma: Reys vaqti yaqinlashmoqda!</b>\n\n"
+            "🚐 Farzandingizning markazga kelish reysi rejalashtirilgan vaqti: <b>08:00</b>.\n"
+            "Iltimos, tayyor bo'lib turing.",
+        )
+
+        # C) 07:35 -> rejalashtirilgan vaqtga yetmaguncha 2-eslatma ketmaydi.
         t_0735 = datetime(2026, 10, 21, 7, 35, 0)
         res_0735 = await scheduler.check_and_send_reminders(now_dt=t_0735)
         assert res_0735["first_reminders"] == 0
@@ -137,43 +166,71 @@ async def test_phase_7_scheduler_and_escalation():
         t_check3 = await db.get_trip_details(test_trip_id)
         assert t_check3["reminder_count"] == 1
 
-        # D) 07:40 (1-eslatmadan 10 daqiqa o'tdi) -> 2-ESLATMA ketishi kerak
-        t_0740 = datetime(2026, 10, 21, 7, 40, 0)
-        res_0740 = await scheduler.check_and_send_reminders(now_dt=t_0740)
-        assert res_0740["first_reminders"] == 0
-        assert res_0740["second_reminders"] == 1
-        assert res_0740["escalations"] == 0
+        # D) 08:00 -> rejalashtirilgan vaqtda 2-ESLATMA.
+        t_0800 = datetime(2026, 10, 21, 8, 0, 0)
+        res_0800 = await scheduler.check_and_send_reminders(now_dt=t_0800)
+        assert res_0800["first_reminders"] == 0
+        assert res_0800["second_reminders"] == 1
+        assert res_0800["escalations"] == 0
         t_check4 = await db.get_trip_details(test_trip_id)
         assert t_check4["reminder_count"] == 2
-        assert t_check4["last_reminder_at"] == "2026-10-21 07:40:00"
+        assert t_check4["last_reminder_at"] == "2026-10-21 08:00:00"
+        assert_exact_message(
+            driver_tg_id,
+            f"⚠️ <b>2-eslatma: Shoshiling! Reys vaqti yetib keldi.</b>\n\n"
+            f"🚐 <b>Reys #{test_trip_id}</b> (Markazga kelish)\n"
+            "⏱ Rejalashtirilgan vaqt: <b>08:00</b>\n"
+            "👥 O'quvchilar ro'yxati:\n  1. Temur Aliyev — Arpaariq\n\n"
+            "Iltimos, harakatni boshlash uchun [🚗 Yo'ldaman] tugmasini bosing:",
+        )
+        assert_exact_message(
+            parent_tg_id,
+            "⚠️ <b>2-eslatma: Shoshiling! Reys vaqti yetib keldi.</b>\n\n"
+            "🚐 Farzandingizning markazga kelish reysi rejalashtirilgan vaqti: <b>08:00</b>.\n"
+            "Iltimos, tayyor bo'lib turing.",
+        )
 
-        # E) 07:45 (2-eslatmadan 5 daqiqa o'tdi) -> Hech narsa yo'q
-        t_0745 = datetime(2026, 10, 21, 7, 45, 0)
-        res_0745 = await scheduler.check_and_send_reminders(now_dt=t_0745)
-        assert res_0745["first_reminders"] == 0
-        assert res_0745["second_reminders"] == 0
-        assert res_0745["escalations"] == 0
+        # E) 08:05 -> eskalatsiyaga hali 10 daqiqa bo'lmadi.
+        t_0805 = datetime(2026, 10, 21, 8, 5, 0)
+        res_0805 = await scheduler.check_and_send_reminders(now_dt=t_0805)
+        assert res_0805["first_reminders"] == 0
+        assert res_0805["second_reminders"] == 0
+        assert res_0805["escalations"] == 0
         t_check5 = await db.get_trip_details(test_trip_id)
         assert t_check5["reminder_count"] == 2
 
-        # F) 07:50 (2-eslatmadan yana 10 daqiqa o'tdi) -> ADMINGA ESKALATSIYA!
-        t_0750 = datetime(2026, 10, 21, 7, 50, 0)
-        res_0750 = await scheduler.check_and_send_reminders(now_dt=t_0750)
-        assert res_0750["first_reminders"] == 0
-        assert res_0750["second_reminders"] == 0
-        assert res_0750["escalations"] == 1
+        # F) 08:10 -> admin eskalatsiyasi.
+        t_0810 = datetime(2026, 10, 21, 8, 10, 0)
+        res_0810 = await scheduler.check_and_send_reminders(now_dt=t_0810)
+        assert res_0810["first_reminders"] == 0
+        assert res_0810["second_reminders"] == 0
+        assert res_0810["escalations"] == 1
         t_check6 = await db.get_trip_details(test_trip_id)
         assert t_check6["reminder_count"] == 3
-        assert t_check6["last_reminder_at"] == "2026-10-21 07:50:00"
+        assert t_check6["last_reminder_at"] == "2026-10-21 08:10:00"
+        assert_exact_message(
+            admin_tg_id,
+            "⚠️ <b>DIQQAT! Reysga javob berilmadi (Eskalatsiya)!</b>\n\n"
+            "Haydovchi: <b>Haydovchi Botir</b> (Tel: +998901234567)\n"
+            f"Reys: <b>#{test_trip_id}</b> (Markazga kelish)\n"
+            "Vaqti: <b>08:00</b>\n\n"
+            "Haydovchi 2 ta eslatmaga ham javob bermadi va [🚗 Yo'ldaman] tugmasini bosmadi!",
+        )
 
-        # G) 07:55 (Eskalatsiyadan so'ng) -> reminder_count=3 bo'lgani uchun takroriy xabar ketmaydi
-        t_0755 = datetime(2026, 10, 21, 7, 55, 0)
-        res_0755 = await scheduler.check_and_send_reminders(now_dt=t_0755)
-        assert res_0755["first_reminders"] == 0
-        assert res_0755["second_reminders"] == 0
-        assert res_0755["escalations"] == 0
+        # G) Eskalatsiyadan so'ng reminder_count=3 bo'lgani uchun takroriy xabar ketmaydi.
+        t_0815 = datetime(2026, 10, 21, 8, 15, 0)
+        res_0815 = await scheduler.check_and_send_reminders(now_dt=t_0815)
+        assert res_0815["first_reminders"] == 0
+        assert res_0815["second_reminders"] == 0
+        assert res_0815["escalations"] == 0
         t_check7 = await db.get_trip_details(test_trip_id)
         assert t_check7["reminder_count"] == 3
+
+        delayed, _, _ = await db.apply_trip_delay(test_trip_id, 15, admin_tg_id)
+        assert delayed is True
+        t_after_delay = await db.get_trip_details(test_trip_id)
+        assert t_after_delay["reminder_count"] == 0
+        assert t_after_delay["last_reminder_at"] is None
 
         # =============================================================
         # 4. "YO'LDAMAN" BOSILGANDA ESLATMALAR TO'XTASHI
@@ -208,9 +265,46 @@ async def test_phase_7_scheduler_and_escalation():
         assert len(re_plan_trips) == 0
 
         # Baza zaxiralash (backup) testi
-        backup_path = scheduler.run_backup_db()
+        backup_path = await scheduler.run_backup_db(backup_dir=str(tmp_path / "backups"))
         assert os.path.exists(backup_path)
 
     finally:
         if os.path.exists(test_db):
             os.remove(test_db)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_trip_is_not_auto_approved(tmp_path):
+    db = Database(str(tmp_path / "cancelled_trip_auto_approve.db"))
+    await db.init_db()
+
+    driver_id = await db.add_driver(
+        full_name="Sinov haydovchisi",
+        phone="+998901234567",
+        telegram_id=99112233,
+    )
+    student_id = await db.add_student(
+        "Sinov o'quvchisi",
+        village_id=1,
+        parent_phone_1="+998901112233",
+    )
+    await db.add_schedule(student_id, weekday=0, start_time="09:00", end_time="11:00")
+
+    scheduler = SchedulerService(db=db)
+    target_date = "2026-10-26"
+    success, reason, _ = await scheduler.run_daily_plan(target_date=target_date)
+    assert success is True
+    assert reason == "success"
+
+    trips = await db.get_trips_by_date(target_date)
+    assert trips
+    cancelled_trip_id = trips[0]["id"]
+    assert await db.cancel_trip(cancelled_trip_id, admin_id=6273865667) is True
+
+    await scheduler.run_auto_approve(target_date=target_date)
+
+    cancelled_trip = await db.get_trip_details(cancelled_trip_id)
+    assert cancelled_trip["status"] == "cancelled"
+    assert cancelled_trip["approved"] == 0
+    unapproved_trips = await db.get_unapproved_trips(target_date)
+    assert cancelled_trip_id not in {trip["id"] for trip in unapproved_trips}

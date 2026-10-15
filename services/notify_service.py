@@ -2,7 +2,7 @@ from typing import Optional, List
 from aiogram import Bot
 from database.db import Database
 from utils.text import escape_html
-from utils.telegram import safe_telegram_call
+from services.telegram_safe import safe_send
 
 class NotifyService:
     @staticmethod
@@ -25,13 +25,12 @@ class NotifyService:
             return logged_ids
 
         for p in parents:
-            status = "sent"
             if bot and p.get("telegram_id"):
-                sent = await safe_telegram_call(
-                    bot.send_message, chat_id=p["telegram_id"], text=text, parse_mode="HTML"
+                status = await safe_send(
+                    bot, p["telegram_id"], text, parse_mode="HTML"
                 )
-                if not sent:
-                    status = "failed"
+            else:
+                status = "failed"
             
             log_id = await db.log_notification(
                 parent_id=p["parent_id"],

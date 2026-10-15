@@ -38,3 +38,14 @@ async def safe_telegram_call(
             logger.info("Telegram rejected a message (%s)", type(exc).__name__)
             return False
     return False
+
+
+async def safe_refresh_edit(callback: Any, text: str, reply_markup: Any) -> None:
+    """Refresh an inline view, treating Telegram's no-change response as success."""
+    try:
+        await callback.message.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).casefold():
+            raise
+    finally:
+        await safe_telegram_call(callback.answer, "Yangilandi!")

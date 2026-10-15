@@ -27,7 +27,8 @@ class TripBuilder:
         min_gap_between_trips_min: int = settings.MIN_GAP_BETWEEN_TRIPS_MIN,
         pickup_lead_min: int = settings.PICKUP_LEAD_MIN,
         stop_dwell_min: int = settings.STOP_DWELL_MIN,
-        max_wait_min: int = settings.MAX_WAIT_MIN
+        max_wait_min: int = settings.MAX_WAIT_MIN,
+        route_buffer_min: int = settings.ROUTE_BUFFER_MIN,
     ):
         self.capacity = capacity
         self.group_window_min = group_window_min
@@ -35,6 +36,7 @@ class TripBuilder:
         self.pickup_lead_min = pickup_lead_min
         self.stop_dwell_min = stop_dwell_min
         self.max_wait_min = max_wait_min
+        self.route_buffer_min = route_buffer_min
 
     def generate_trips_for_day(
         self,
@@ -49,7 +51,7 @@ class TripBuilder:
            - Kelish (to_center): start_time bo'yicha GROUP_WINDOW_MIN va MAX_WAIT_MIN doirasida guruhlanadi.
              CAPACITY (9) oshsa reys bo'linadi.
              Reys ichida route_order ASC (1-uzoqlikdan markazga tomon) tartiblanadi.
-             planned_time = eng_erta_start - pickup_lead_min (30) - max(travel_minutes) - (to'xtashlar_soni * stop_dwell_min).
+             planned_time = eng_erta_start - max(travel_minutes) - dwell_total - route_buffer_min.
            - Qaytish (to_home): end_time bo'yicha GROUP_WINDOW_MIN doirasida guruhlanadi.
              CAPACITY (9) oshsa bo'linadi.
              Reys ichida route_order DESC (yaqindan uzoqqa tomon) tartiblanadi.
@@ -125,7 +127,10 @@ class TripBuilder:
                 earliest_start_dt = st_dt
             else:
                 diff_min = int((st_dt - earliest_start_dt).total_seconds() // 60)
-                if diff_min <= self.group_window_min and diff_min <= self.max_wait_min:
+                if (
+                    diff_min <= self.group_window_min
+                    and diff_min + self.route_buffer_min <= self.max_wait_min
+                ):
                     current_cluster.append(sc)
                 else:
                     clusters.append(current_cluster)
@@ -145,13 +150,13 @@ class TripBuilder:
                 # SATR: route_order ASC bo'yicha saralash (1-uzoqlikdan markazga tomon yaqinlashish)
                 chunk.sort(key=lambda x: (x.get("route_order", 0), x.get("student_id", 0)))
 
-                # planned_time = eng_erta_start - 30 daqiqa - max(travel_minutes) - (to'xtashlar_soni * STOP_DWELL_MIN)
+                # planned_time = eng_erta_start - max(travel_minutes) - dwell_total - ROUTE_BUFFER_MIN
                 earliest_min = min(time_to_minutes(x["start_time"]) for x in chunk)
                 max_travel = max(x.get("travel_minutes", 0) for x in chunk)
                 unique_stops = len(set(x["village_id"] for x in chunk))
                 dwell_total = unique_stops * self.stop_dwell_min
 
-                planned_minutes = earliest_min - self.pickup_lead_min - max_travel - dwell_total
+                planned_minutes = earliest_min - max_travel - dwell_total - self.route_buffer_min
                 planned_time_str = minutes_to_time(planned_minutes)
 
                 items = []

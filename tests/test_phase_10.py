@@ -5,6 +5,10 @@ import time
 import uuid
 import sqlite3
 from datetime import datetime
+from unittest.mock import AsyncMock
+from aiogram import Bot, Dispatcher
+from aiogram.methods import EditMessageText, SendMessage
+from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
 from config import settings, get_default_db_path, get_default_backup_dir
 from database.db import Database
@@ -17,7 +21,7 @@ from handlers.parent import parent_router
 from middlewares.roles import RoleMiddleware
 
 @pytest.mark.asyncio
-async def test_phase_10_railway_deploy_and_volume():
+async def test_phase_10_railway_deploy_and_volume(tmp_path):
     # =============================================================
     # 1. RAILWAY VOLUME VA DINAMIK DB YO'LI TEKSHIRUVI
     # =============================================================
@@ -43,11 +47,11 @@ async def test_phase_10_railway_deploy_and_volume():
         # =============================================================
         # 2. ZAXIRALASH VA 7 KUNLIK ESKI FAYLLARNI TOZALASH TEKSHIRUVI
         # =============================================================
-        test_backup_dir = os.path.join(test_volume_dir, "backups")
+        test_backup_dir = str(tmp_path / "backups")
         scheduler = SchedulerService(db=db)
 
         # 2.1 Yangi zaxira olish
-        created_backup = scheduler.run_backup_db(db_path=test_vol_db_path, backup_dir=test_backup_dir)
+        created_backup = await scheduler.run_backup_db(db_path=test_vol_db_path, backup_dir=test_backup_dir)
         assert os.path.exists(created_backup)
         with sqlite3.connect(created_backup) as backup_conn:
             assert backup_conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -98,7 +102,7 @@ async def test_phase_10_railway_deploy_and_volume():
             "apscheduler",
             "pydantic-settings",
             "openpyxl",
-            "pandas",
+            "tzdata",
             "pytest",
             "pytest-asyncio"
         ]
@@ -109,7 +113,6 @@ async def test_phase_10_railway_deploy_and_volume():
         # 4. DISPATCHER VA ROUTERLAR IERARXIYASI TEKSHIRUVI
         # =============================================================
         # Barcha routerlar mavjud va Router obyektlari ekanligi
-        from aiogram import Dispatcher
         dp = Dispatcher()
 
         dp.message.middleware(RoleMiddleware(db))
@@ -126,6 +129,82 @@ async def test_phase_10_railway_deploy_and_volume():
         assert len(registered_routers) == 5
         router_names = [r.__class__.__name__ for r in registered_routers]
         assert all(name == "Router" for name in router_names)
+
+        # Bir xil jadval tugmasi bosilganda ota-ona admin routerdan o'tib parent handleriga yetadi.
+        parent_tg_id = max(settings.admin_ids_list or [0]) + 1
+        await db.add_parent(parent_tg_id, "+998901234567")
+        db.get_parent_by_telegram_id = AsyncMock(wraps=db.get_parent_by_telegram_id)
+        bot = Bot(token="123456:TESTTOKEN")
+        bot.session.make_request = AsyncMock(return_value=Message(
+            message_id=1,
+            date=datetime.now(),
+            chat=Chat(id=parent_tg_id, type="private"),
+            text="ok",
+        ))
+        update = Update(
+            update_id=1,
+            message=Message(
+                message_id=2,
+                date=datetime.now(),
+                chat=Chat(id=parent_tg_id, type="private"),
+                from_user=User(id=parent_tg_id, is_bot=False, first_name="Parent"),
+                text="📅 Dars jadvali",
+            ),
+        )
+        try:
+            await dp.feed_update(bot, update, db=db)
+            db.get_parent_by_telegram_id.assert_awaited_once_with(parent_tg_id)
+            bot.session.make_request.assert_awaited_once()
+            sent_method = bot.session.make_request.await_args.args[1]
+            assert isinstance(sent_method, SendMessage)
+            assert sent_method.text == "Sizga biriktirilgan farzandlar topilmadi."
+
+            # Admin callbacks arrive with the bot as callback.message.from_user;
+            # route them through the dispatcher and verify the correct view edits
+            # the existing bot message (rather than invoking message handlers).
+            admin_id = settings.admin_ids_list[0]
+            await db.add_driver(987654321, "Test Haydovchi", "+998901234567")
+            await db.add_staff(987654322, "Test Xodim", "+998911234567")
+            await db.add_student("Test O'quvchi", 1, "+998901234567")
+
+            for update_id, target, expected_title in (
+                (10, "drivers", "Haydovchilar ro'yxati"),
+                (11, "staff", "Xodimlar (Staff) ro'yxati"),
+                (12, "villages", "Mahallalar va marshrut zonalari"),
+                (13, "students", "Faol o'quvchilar ro'yxati"),
+            ):
+                nav_update = Update(
+                    update_id=update_id,
+                    callback_query=CallbackQuery(
+                        id=f"callback-{update_id}",
+                        from_user=User(id=admin_id, is_bot=False, first_name="Admin"),
+                        chat_instance="admin-chat",
+                        data=f"admin_nav:{target}",
+                        message=Message(
+                            message_id=100 + update_id,
+                            date=datetime.now(),
+                            chat=Chat(id=admin_id, type="private"),
+                            from_user=User(id=999999999, is_bot=True, first_name="Bot"),
+                            text="Admin bo'limlari",
+                        ),
+                    ),
+                )
+                bot.session.make_request.reset_mock()
+                await dp.feed_update(bot, nav_update, db=db)
+                edit_method = next(
+                    method
+                    for call in bot.session.make_request.await_args_list
+                    for method in (call.args[1],)
+                    if isinstance(method, EditMessageText)
+                )
+                assert isinstance(edit_method, EditMessageText)
+                assert expected_title in edit_method.text
+
+            state_context = dp.fsm.get_context(bot=bot, chat_id=admin_id, user_id=admin_id)
+            from handlers.admin import EditStudentStates
+            assert await state_context.get_state() == EditStudentStates.selecting_student.state
+        finally:
+            await bot.session.close()
 
     finally:
         if os.path.exists(test_volume_dir):
