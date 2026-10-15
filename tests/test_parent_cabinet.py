@@ -21,7 +21,7 @@ from handlers.parent import (
 from models.enums import TripItemStatus
 
 @pytest.mark.asyncio
-async def test_parent_cabinet_and_fsm_absence():
+async def test_parent_cabinet_and_fsm_absence(monkeypatch):
     test_db = f"test_parent_{uuid.uuid4().hex[:8]}.db"
     db = Database(test_db)
 
@@ -44,7 +44,10 @@ async def test_parent_cabinet_and_fsm_absence():
         assert "📞 Markaz bilan aloqa" in all_buttons
 
         mock_bot = AsyncMock()
-        admin_tg_id = settings.admin_ids_list[0] if settings.admin_ids_list else 6273865667
+        admin_tg_id = 6273865667
+        monkeypatch.setattr(settings, "ADMIN_IDS", str(admin_tg_id))
+        center_admin_tg_id = 8067625824
+        monkeypatch.setattr(settings, "CENTER_ADMIN_TG_ID", center_admin_tg_id)
         parent_tg_id = 99887766
         driver_tg_id = 88776655
 
@@ -178,17 +181,22 @@ async def test_parent_cabinet_and_fsm_absence():
             parse_mode="HTML"
         )
 
-        # Adminga xabar borganini tekshirish
-        admin_call_found = False
+        # Markaz adminiga xabar borganini, bot adminlariga yuborilmaganini tekshirish
+        center_admin_call_found = False
         for call in mock_bot.send_message.call_args_list:
-            if call[1].get("chat_id") == admin_tg_id and "Kelmaslik xabarnomasi" in call[1].get("text", ""):
-                admin_call_found = True
+            if call[1].get("chat_id") == center_admin_tg_id and "Kelmaslik xabarnomasi" in call[1].get("text", ""):
+                center_admin_call_found = True
                 assert "Ali Aliyev" in call[1]["text"]
                 encoded_reason = "&lt;b&gt;Shamollab&lt;/b&gt; &amp; shifokorga olib boramiz"
                 assert encoded_reason in call[1]["text"]
                 assert unescape(encoded_reason) == reason_text
                 assert call[1]["parse_mode"] == "HTML"
-        assert admin_call_found, "Adminga kelmaslik xabarnomasi bormadi!"
+        assert center_admin_call_found, "Markaz adminiga kelmaslik xabarnomasi bormadi!"
+        assert not any(
+            call[1].get("chat_id") == admin_tg_id
+            and "Kelmaslik xabarnomasi" in call[1].get("text", "")
+            for call in mock_bot.send_message.call_args_list
+        )
 
         # =============================================================
         # 8. MASHINADA BO'LGAN (st2, picked_up) BOLA RAD ETILISHI

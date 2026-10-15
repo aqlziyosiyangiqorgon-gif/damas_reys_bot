@@ -9,11 +9,12 @@ from aiogram.types import CallbackQuery, User, Message
 from database.db import Database
 from services.excel_service import ExcelService
 from handlers.parent import cb_student_absent
+from config import settings
 from handlers.admin import PENDING_EXCEL_IMPORTS, cb_excel_save, cb_excel_cancel
 from models.enums import TripItemStatus
 
 @pytest.mark.asyncio
-async def test_phase_8_absence_and_excel_import():
+async def test_phase_8_absence_and_excel_import(monkeypatch):
     test_db = f"test_phase8_{uuid.uuid4().hex[:8]}.db"
     db = Database(test_db)
 
@@ -23,6 +24,8 @@ async def test_phase_8_absence_and_excel_import():
         await db.init_db()
 
         mock_bot = AsyncMock()
+        center_admin_tg_id = 8067625824
+        monkeypatch.setattr(settings, "CENTER_ADMIN_TG_ID", center_admin_tg_id)
 
         parent_tg_id = 55115511
         driver_tg_id = 77117711
@@ -96,10 +99,18 @@ async def test_phase_8_absence_and_excel_import():
 
         # Haydovchiga xabar yuborilganligini tekshirish
         assert mock_bot.send_message.call_count >= 1
-        driver_call_args = mock_bot.send_message.call_args[1]
+        driver_call_args = next(
+            call[1] for call in mock_bot.send_message.call_args_list
+            if call[1].get("chat_id") == driver_tg_id
+        )
         assert driver_call_args["chat_id"] == driver_tg_id
         assert "Bekzod Usmonov" in driver_call_args["text"]
         assert "bugun kelmaydi" in driver_call_args["text"]
+        assert any(
+            call[1].get("chat_id") == center_admin_tg_id
+            and "Kelmaslik xabarnomasi" in call[1].get("text", "")
+            for call in mock_bot.send_message.call_args_list
+        )
 
         # Takroriy bosishda alert berilishi
         parent_cb1.answer.reset_mock()

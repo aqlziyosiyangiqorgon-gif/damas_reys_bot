@@ -26,6 +26,22 @@ from services.telegram_safe import safe_send
 
 parent_router = Router()
 
+
+async def _notify_center_admin_absence(bot, info: dict, reason: str = "") -> None:
+    """Notify the center's operational admin, independently of bot admins."""
+    student_name = escape_html(info.get("student_name", "O'quvchi"))
+    village_name = escape_html(info.get("village_name", ""))
+    parent_phone = escape_html(info.get("parent_phone", ""))
+    text = (
+        "⚠️ <b>Kelmaslik xabarnomasi!</b>\n"
+        f"👤 O'quvchi: <b>{student_name}</b> ({village_name})\n"
+        f"📞 Ota-ona: <code>{parent_phone}</code>\n"
+    )
+    if reason:
+        text += f"💬 Sababi: <i>{escape_html(reason)}</i>\n"
+    text += "🚐 Bugungi reysdan chiqarildi."
+    await safe_send(bot, settings.CENTER_ADMIN_TG_ID, text, parse_mode="HTML")
+
 WEEKDAYS_UZ = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"]
 
 class ParentStates(StatesGroup):
@@ -407,7 +423,6 @@ async def process_absence_reason(message: types.Message, state: FSMContext, db: 
 
     st_name = info.get("student_name", "O'quvchi")
     v_name = info.get("village_name", "")
-    p_phone = info.get("parent_phone", "")
 
     # 2. Haydovchiga xabar (agar reys va haydovchi bo'lsa)
     if info.get("driver_tg_id") and message.bot:
@@ -418,17 +433,9 @@ async def process_absence_reason(message: types.Message, state: FSMContext, db: 
             parse_mode="HTML",
         )
 
-    # 3. Barcha adminlarga xabar
-    admin_text = (
-        f"⚠️ <b>Kelmaslik xabarnomasi!</b>\n"
-        f"👤 O'quvchi: <b>{escape_html(st_name)}</b> ({escape_html(v_name)})\n"
-        f"📞 Ota-ona: <code>{escape_html(p_phone)}</code>\n"
-        f"💬 Sababi: <i>{escape_html(reason)}</i>\n"
-        f"🚐 Bugungi reysdan chiqarildi."
-    )
+    # 3. Faqat markaz adminiga yuboriladi; bot adminlari ro'yxati alohida.
     if message.bot:
-        for admin_id in settings.admin_ids_list:
-            await safe_send(message.bot, admin_id, admin_text, parse_mode="HTML")
+        await _notify_center_admin_absence(message.bot, info, reason)
 
 # --- 8. Mavjud inline tugma orqali kelmaslikni belgilash (Phase 8 test mosligi) ---
 @parent_router.callback_query(AbsentButtonCallback.filter())
@@ -470,5 +477,8 @@ async def cb_student_absent(callback: types.CallbackQuery, db: Database, callbac
             f"ℹ️ <b>{escape_html(info['student_name'])}</b> ({escape_html(info['village_name'])}) bugun kelmaydi deb belgilandi.",
             parse_mode="HTML",
         )
+
+    if info and callback.bot:
+        await _notify_center_admin_absence(callback.bot, info)
 
     await callback.answer("Farzandingiz bugun kelmaydi deb belgilandi.", show_alert=True)

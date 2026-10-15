@@ -309,7 +309,29 @@ def _normalize_apostrophes(text: str) -> str:
 
 
 def _read_excel_rows(file_path: str) -> Tuple[List[Any], List[Tuple[Any, ...]]]:
-    """Load cell values off the event loop and return plain Python data."""
+    """Load .xlsx and legacy .xls cell values off the event loop."""
+    extension = os.path.splitext(file_path)[1].lower()
+    if extension == ".xls":
+        import xlrd
+
+        workbook = xlrd.open_workbook(file_path, on_demand=True)
+        try:
+            worksheet = workbook.sheet_by_index(0)
+            rows = []
+            for row_idx in range(worksheet.nrows):
+                row = []
+                for col_idx in range(worksheet.ncols):
+                    cell = worksheet.cell(row_idx, col_idx)
+                    value = cell.value
+                    if cell.ctype == xlrd.XL_CELL_NUMBER and value.is_integer():
+                        value = int(value)
+                    row.append(value)
+                rows.append(tuple(row))
+            headers = list(rows[0]) if rows else []
+            return headers, rows[1:]
+        finally:
+            workbook.release_resources()
+
     workbook = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
     try:
         worksheet = workbook.active

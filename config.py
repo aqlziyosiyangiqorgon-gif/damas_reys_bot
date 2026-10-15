@@ -31,6 +31,9 @@ def get_default_backup_dir() -> str:
 class Settings(BaseSettings):
     BOT_TOKEN: str = "YOUR_BOT_TOKEN_HERE"
     ADMIN_IDS: str = ""
+    # Markaz administratoriga ota-onalarning kelmaslik xabarlari yuboriladi.
+    # Bu bot administratorlari (ADMIN_IDS) ro'yxatidan alohida.
+    CENTER_ADMIN_TG_ID: int = 8067625824
     
     # Standart sozlamalar
     CAPACITY: int = 9

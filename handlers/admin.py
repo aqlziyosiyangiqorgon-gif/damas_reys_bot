@@ -1156,7 +1156,12 @@ async def process_admin_excel_upload(message: types.Message, db: Database):
     if not is_admin(message.from_user.id):
         return
     doc = message.document
-    if not doc.file_name or os.path.splitext(doc.file_name)[1].lower() != ".xlsx":
+    extension = os.path.splitext(doc.file_name or "")[1].lower()
+    if extension not in {".xlsx", ".xls"}:
+        await message.answer(
+            "Excel fayl .xlsx yoki .xls formatida bo'lishi kerak. "
+            "Bot shablonini to'ldirib, faylni hujjat sifatida qayta yuboring."
+        )
         return
     if getattr(doc, "file_size", None) is not None and doc.file_size > 10 * 1024 * 1024:
         await message.answer("Excel fayl hajmi 10 MB dan oshmasligi kerak.")
@@ -1166,7 +1171,7 @@ async def process_admin_excel_upload(message: types.Message, db: Database):
     import uuid
     from services.excel_service import ExcelService
 
-    with tempfile.NamedTemporaryFile(prefix="damas_excel_", suffix=".xlsx", delete=False) as temp_file:
+    with tempfile.NamedTemporaryFile(prefix="damas_excel_", suffix=extension, delete=False) as temp_file:
         temp_path = temp_file.name
     try:
         await message.bot.download(doc, destination=temp_path)
@@ -1955,7 +1960,7 @@ async def cb_admin_excel_upload_info(callback: types.CallbackQuery):
         "📥 <b>Yangi Excel yuklash bo'yicha yo'riqnoma:</b>\n\n"
         "1. Avval [📄 Bo'sh shablon olish] tugmasi orqali shablonni yuklab oling.\n"
         "2. Shablon ustunlarini to'ldiring (vaqtlarni <code>09:00-11:00</code> formatida kiriting).\n"
-        "3. Tayyor bo'lgan <b>.xlsx</b> faylni to'g'ridan-to'g'ri ushbu bot chatiga fayl (document) sifatida tashlang.\n\n"
+        "3. Tayyor bo'lgan <b>.xlsx yoki .xls</b> faylni to'g'ridan-to'g'ri ushbu bot chatiga fayl (document) sifatida tashlang.\n\n"
         "<i>Bot avtomatik tarzda ma'lumotlarni tekshirib, saqlashdan oldin sizga hisobot taqdim etadi.</i>"
     )
     await callback.message.edit_text(text, parse_mode="HTML")
