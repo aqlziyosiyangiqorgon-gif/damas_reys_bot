@@ -1,5 +1,7 @@
 from utils.clock import now_tz
 import logging
+import os
+import tempfile
 from datetime import datetime
 from aiogram import Router, types, F
 from aiogram.filters import Command
@@ -15,7 +17,8 @@ from models.callbacks import (
     DriverPickupVillageCallback, DriverRefreshTripCallback, DriverStartTripCallback,
 )
 from services.notify_service import NotifyService
-from services.telegram_safe import safe_send
+from services.driver_route_pdf import build_driver_daily_pdf
+from services.telegram_safe import safe_send, safe_send_document
 from utils.text import escape_html
 from utils.telegram import safe_refresh_edit
 
@@ -187,11 +190,56 @@ async def cmd_driver_trips(message: types.Message, db: Database, user_role: User
         )
         return
 
-    await message.answer(f"🚐 <b>Bugungi ({date_str}) reyslaringiz:</b>", reply_markup=get_driver_menu_kb(), parse_mode="HTML")
+    intro = f"🚐 <b>Bugungi ({date_str}) reyslaringiz</b>\nTo'liq vaqtlar va o'quvchilar ro'yxati bitta PDF faylda."
+    if getattr(message, "chat", None) is None or getattr(message.chat, "id", None) is None:
+        # Keep direct handler callers (for example, detached test messages) usable.
+        await message.answer(intro, reply_markup=get_driver_menu_kb(), parse_mode="HTML")
+        for trip in trips:
+            direction = "Markazga kelish" if trip["direction"] == TripDirection.TO_CENTER.value else "Uyga qaytish"
+            control_text = (
+                f"🎛 <b>Reys #{trip['id']} boshqaruvi</b>\n"
+                f"{direction} · <b>{escape_html(trip['planned_time'])}</b> · {len(trip.get('items', []))} nafar\n"
+                "O'quvchilar va olish vaqtlari yuqoridagi PDFda."
+            )
+            await message.answer(control_text, reply_markup=build_driver_trip_keyboard(trip), parse_mode="HTML")
+        return
+
+    await safe_send(
+        message.bot, message.chat.id, intro,
+        reply_markup=get_driver_menu_kb(), parse_mode="HTML",
+    )
+    pdf_status = "failed"
+    try:
+        pdf_data = build_driver_daily_pdf(trips, driver["full_name"], date_str)
+        with tempfile.TemporaryDirectory(prefix="aql-driver-routes-") as temp_dir:
+            pdf_path = os.path.join(temp_dir, f"bugungi_reyslar_{date_str}.pdf")
+            with open(pdf_path, "wb") as pdf_file:
+                pdf_file.write(pdf_data)
+            pdf_status = await safe_send_document(
+                message.bot, message.chat.id, pdf_path,
+                f"AQL ZIYOSI | Bugungi reyslar: {date_str} | {len(trips)} ta reys",
+            )
+    except Exception as exc:
+        # Telegram token and student data must never enter logs.
+        logger.error("Driver route PDF send failed (%s)", type(exc).__name__)
+
+    if pdf_status != "sent":
+        await safe_send(
+            message.bot, message.chat.id,
+            "PDF ro'yxatini yuborib bo'lmadi. Quyidagi tugmalar orqali reysni boshqarishingiz mumkin.",
+        )
+
     for trip in trips:
-        card_text = format_trip_card_text(trip)
-        kb = build_driver_trip_keyboard(trip)
-        await message.answer(card_text, reply_markup=kb, parse_mode="HTML")
+        direction = "Markazga kelish" if trip["direction"] == TripDirection.TO_CENTER.value else "Uyga qaytish"
+        control_text = (
+            f"🎛 <b>Reys #{trip['id']} boshqaruvi</b>\n"
+            f"{direction} · <b>{escape_html(trip['planned_time'])}</b> · {len(trip.get('items', []))} nafar\n"
+            "O'quvchilar va olish vaqtlari yuqoridagi PDFda."
+        )
+        await safe_send(
+            message.bot, message.chat.id, control_text,
+            reply_markup=build_driver_trip_keyboard(trip), parse_mode="HTML",
+        )
 
 # --- 1b. Markaz / Admin bilan aloqa ---
 @driver_router.message(F.text == "📞 Markaz / Admin")

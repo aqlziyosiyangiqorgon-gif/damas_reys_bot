@@ -262,6 +262,51 @@ h1 { margin: 0; color: var(--brand-navy); font-size: 17px; font-weight: 780; let
 .billing-balance { color: #2e7353; font-size: 12px; font-weight: 750; }
 .billing-balance.due { color: #9a6500; }
 
+.parent-child-card {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 19px;
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+.parent-child-summary {
+  display: flex;
+  min-height: 74px;
+  align-items: center;
+  gap: 9px;
+  padding: 13px 15px;
+  color: var(--brand-navy);
+  background: linear-gradient(110deg, #fff, #f8fafb);
+  cursor: pointer;
+  list-style: none;
+}
+.parent-child-summary::-webkit-details-marker { display: none; }
+.parent-child-summary::after { content: "⌄"; margin-left: auto; color: var(--muted); font-size: 20px; transition: transform .16s ease; }
+.parent-child-card[open] > .parent-child-summary::after { transform: rotate(180deg); }
+.parent-child-name { display: grid; min-width: 0; flex: 1; gap: 3px; }
+.parent-child-name strong { overflow-wrap: anywhere; font-size: 14px; line-height: 1.3; }
+.parent-child-name small { color: var(--muted); font-size: 11px; }
+.parent-child-debt {
+  max-width: 40%;
+  padding: 6px 9px;
+  border: 1px solid #d9e8df;
+  border-radius: 999px;
+  color: #2e7353;
+  background: #f1f8f4;
+  font-size: 10px;
+  font-weight: 800;
+  text-align: center;
+  white-space: nowrap;
+}
+.parent-child-debt.due { border-color: #f0d18a; color: #845b08; background: var(--brand-orange-soft); }
+.parent-child-body { display: grid; gap: 11px; padding: 0 14px 15px; }
+.parent-detail-block { padding: 12px; border: 1px solid #e9eef2; border-radius: 15px; background: #fbfcfd; }
+.parent-detail-block h3 { margin: 0 0 8px; color: var(--brand-navy); font-size: 13px; font-weight: 780; }
+.parent-detail-block .schedule-list { margin-top: 2px; }
+.parent-detail-block .reason-input { margin-top: 6px; }
+.parent-detail-block .action-button { width: 100%; margin-top: 10px; }
+.absence-confirmation { padding: 10px; border-radius: 11px; color: #2e7353; background: #f1f8f4; font-size: 12px; font-weight: 700; }
+
 .badge {
   display: inline-flex;
   min-height: 26px;

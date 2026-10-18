@@ -1203,16 +1203,19 @@ class Database:
         try:
             cur = await conn.execute("SELECT * FROM trips WHERE driver_id = ? AND date = ? ORDER BY planned_time ASC", (driver_id, date))
             trips = [dict(r) for r in await cur.fetchall()]
+            day_of_week = datetime.strptime(date, "%Y-%m-%d").weekday()
             for t in trips:
                 cur_items = await conn.execute("""
                     SELECT ti.*, s.full_name, s.parent_phone_1 as parent_phone,
-                           v.name as village_name, v.travel_minutes, v.route_order, v.pickup_point
+                           v.name as village_name, v.travel_minutes, v.route_order, v.pickup_point,
+                           sch.start_time AS lesson_start_time, sch.end_time AS lesson_end_time
                     FROM trip_items ti
                     JOIN students s ON ti.student_id = s.id
                     JOIN villages v ON ti.village_id = v.id
+                    LEFT JOIN schedules sch ON sch.student_id = s.id AND sch.weekday = ?
                     WHERE ti.trip_id = ?
                     ORDER BY CASE WHEN ? = 'to_center' THEN v.route_order ELSE -v.route_order END ASC
-                """, (t["id"], t["direction"]))
+                """, (day_of_week, t["id"], t["direction"]))
                 t["items"] = [dict(r) for r in await cur_items.fetchall()]
                 t["type"] = t["direction"]
             return trips
