@@ -1,6 +1,7 @@
 import os
 import sqlite3
 from pathlib import Path
+from urllib.parse import urlsplit
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
@@ -81,6 +82,7 @@ class Settings(BaseSettings):
     BACKUP_DIR: str = get_default_backup_dir()
     BACKUP_RETENTION_DAYS: int = 7
     BACKUP_CHAT_ID: int | None = None
+    MINIAPP_URL: str = ""
 
     @field_validator("BACKUP_CHAT_ID", mode="before")
     @classmethod
@@ -88,6 +90,18 @@ class Settings(BaseSettings):
         if value is None or (isinstance(value, str) and not value.strip()):
             return None
         return int(value)
+
+    @field_validator("MINIAPP_URL", mode="before")
+    @classmethod
+    def validate_miniapp_url(cls, value):
+        value = (value or "").strip()
+        if not value:
+            return ""
+        parsed = urlsplit(value)
+        if (parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password
+                or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+            raise ValueError("MINIAPP_URL must be a public HTTPS site root")
+        return value.rstrip("/")
 
     model_config = SettingsConfigDict(
         env_file=os.path.join(BASE_DIR, ".env"), env_file_encoding="utf-8", extra="ignore"

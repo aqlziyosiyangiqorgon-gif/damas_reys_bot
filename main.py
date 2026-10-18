@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -15,6 +16,8 @@ from handlers.staff import staff_router
 from handlers.parent import parent_router
 from services.scheduler_service import SchedulerService
 from middlewares.sqlite_storage import SQLiteFSMStorage
+from services.miniapp_server import MiniAppServer
+from aiogram.types import MenuButtonWebApp, WebAppInfo
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,12 +74,27 @@ async def main():
     scheduler = SchedulerService(db=db, bot=bot)
     dp["scheduler"] = scheduler
     scheduler.start()
+    miniapp_server = None
 
     try:
+        if settings.MINIAPP_URL:
+            miniapp_server = MiniAppServer(db, bot=bot, scheduler=scheduler)
+            await miniapp_server.start(port=int(os.getenv("PORT", "8080")))
+            try:
+                await bot.set_chat_menu_button(
+                    menu_button=MenuButtonWebApp(
+                        text="🚐 Ilova",
+                        web_app=WebAppInfo(url=settings.MINIAPP_URL),
+                    )
+                )
+            except Exception as exc:
+                logger.error("Mini App menu button setup failed (%s)", type(exc).__name__)
         logger.info("Bot to'liq ishlab chiqarish (production) rejimida ishga tushmoqda...")
         await dp.start_polling(bot)
     finally:
         logger.info("Bot to'xtatilmoqda (Graceful shutdown)...")
+        if miniapp_server:
+            await miniapp_server.stop()
         scheduler.stop()
         await bot.session.close()
         await fsm_storage.close()

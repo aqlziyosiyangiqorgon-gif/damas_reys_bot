@@ -49,6 +49,12 @@ Deploydan oldin eski SQLite faylni Volume ichiga ko'chiring yoki tiklang. Bot Ra
 
 Volume sozlash bo'yicha ko'rsatma: [Railway Volumes](https://docs.railway.com/volumes).
 
+## Telegram Mini App
+
+Mini App ota-ona, haydovchi, markaz xodimi va admin uchun rolga mos sahifani ko'rsatadi. Ota-ona farzandining holati va haftalik jadvalini ko'radi hamda kelmasligini bildiradi; haydovchi va xodim bugungi reys amallarini bajaradi; admin reja va tasdiqlarni boshqaradi.
+
+Railway service'ga public HTTPS domain bering va `MINIAPP_URL` qiymatiga shu manzilni kiriting. Xizmat `PORT` orqali sahifani va API'ni bir xil bot jarayonida ochadi; bot Telegram menyusida `🚐 Ilova` tugmasini ko'rsatadi. Mini App ochilishi uchun Telegram serveri `initData` imzosini va vaqtini tekshiradi. `MINIAPP_URL` bo'sh bo'lsa, bot Mini App serverini ishga tushirmaydi.
+
 ## Asosiy admin buyruqlari
 
 - `/qoshish` — o'quvchi va dars jadvalini qo'shish
