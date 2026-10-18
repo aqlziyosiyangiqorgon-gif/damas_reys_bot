@@ -86,12 +86,12 @@
               : invoice.paid_total > 0 ? "Qisman to‘langan" : "To‘lanmagan";
         block.append(node("p", `${formatBillingPeriod(invoice.period)} · ${status}`, "billing-period"));
         if (invoice.billing_mode === "attendance") {
-          block.append(node("p", `Jadval bo‘yicha ${invoice.lesson_count} dars × ${formatMoney(invoice.lesson_rate)} so‘m`, "billing-line"));
+          block.append(node("p", "Oylik tarif ro‘yxatdan o‘tgan kundan oy oxirigacha hisoblangan.", "billing-line"));
         }
         block.append(node("p", `Hisob: ${formatMoney(invoice.amount - invoice.discount)} · To‘langan: ${formatMoney(invoice.paid_total)}`, "billing-line"));
         block.append(node("p", `Qoldiq: ${formatMoney(invoice.due)}`, `billing-balance${invoice.due > 0 ? " due" : ""}`));
       } else {
-        block.append(node("p", `${formatBillingPeriod(billing?.period)} uchun hisob dars jadvali asosida avtomatik ochiladi.`, "muted billing-line"));
+        block.append(node("p", `${formatBillingPeriod(billing?.period)} uchun oylik qarz ro‘yxatdan o‘tgan sanadan oy oxirigacha hisoblanadi.`, "muted billing-line"));
       }
       for (const oldInvoice of childBilling.overdue_invoices || []) {
         block.append(node("p", `⏳ ${formatBillingPeriod(oldInvoice.period)} qarzi: ${formatMoney(oldInvoice.due)}`, "billing-balance due"));
@@ -663,18 +663,53 @@
     const drawBilling = query => {
       billingList.replaceChildren();
       const needle = String(query || "").trim().toLocaleLowerCase("uz");
-      const matching = data.billing_students.filter(student => !needle || student.full_name.toLocaleLowerCase("uz").includes(needle));
+      const matching = data.billing_students
+        .filter(student => !needle || student.full_name.toLocaleLowerCase("uz").includes(needle))
+        .sort((a, b) => {
+          const priority = student => student.invoice_id !== null && student.status !== "waived" && student.due > 0 ? 0
+            : student.invoice_id === null && student.days_per_week > 0 && !student.monthly_amount ? 1
+              : student.invoice_id === null ? 2 : 3;
+          return priority(a) - priority(b) || Number(b.due || 0) - Number(a.due || 0)
+            || a.full_name.localeCompare(b.full_name, "uz");
+        });
       billingList.append(node("p", `${matching.length} ta o‘quvchi`, "muted"));
       if (!matching.length) { billingList.append(empty("Mos o‘quvchi topilmadi.")); return; }
       if (matching.length > 50) billingList.append(node("p", "Ko‘p natija topildi. Qidiruvni aniqroq kiriting; dastlabki 50 tasi ko‘rsatilmoqda.", "muted"));
       for (const student of matching.slice(0, 50)) {
-      const status = student.invoice_id === null ? "Hisob ochilmagan" : student.status === "waived" ? "Bekor qilingan" : student.amount === 0 && student.due === 0 ? "Hozircha qarz yo‘q" : student.due === 0 ? "To‘langan" : `Qarz ${Number(student.due).toLocaleString("uz-UZ")} so‘m`;
+      const status = student.invoice_id === null
+        ? student.days_per_week > 0 && !student.monthly_amount ? "Tarif kiritish kerak" : "Hisob ochilmagan"
+        : student.status === "waived" ? "Bekor qilingan"
+          : student.amount === 0 && student.due === 0 ? "Hozircha qarz yo‘q"
+            : student.due === 0 ? "To‘langan" : `Qarz ${Number(student.due).toLocaleString("uz-UZ")} so‘m`;
       const section = card(student.full_name, `${student.days_per_week} kun/hafta`, status);
       if (student.invoice_id === null) {
-        section.append(node("p", "Hisob o‘quvchi qo‘shilganda yoki oy boshida jadval bo‘yicha avtomatik ochiladi. Jadvalni tekshiring.", "muted"));
+        if (student.days_per_week > 0 && !student.monthly_amount) {
+          section.append(node("p", "Bu jadval uchun to‘liq oylik tarifni kiriting. Joriy oy summasi ro‘yxatdan o‘tgan sanadan oy oxirigacha hisoblanadi.", "muted"));
+          const tariff = makeForm("To‘liq oylik tarif", "Tarifni saqlash", formEl => {
+            const amount = Number(formValue(new FormData(formEl), "amount"));
+            if (!Number.isInteger(amount) || amount <= 0) throw new Error("Oylik tarifni musbat butun so‘mda kiriting.");
+            return runAdminAction("set_billing_tariff", { student_id: student.id, period: adminPeriod, amount });
+          });
+          tariff.insertBefore(makeField("So‘m", "amount", "number", "", true, { min: 1, max: 2000000000, step: 1000 }), tariff.querySelector('[type="submit"]'));
+          section.append(tariff);
+        } else {
+          section.append(node("p", "Hisob ochilmagan. Dars jadvali va o‘quvchining ro‘yxatga olingan sanasini tekshiring.", "muted"));
+        }
       } else {
         section.append(node("p", `Hisob: ${Number(student.amount).toLocaleString("uz-UZ")} · Chegirma: ${Number(student.discount).toLocaleString("uz-UZ")} · To‘langan: ${Number(student.paid_total).toLocaleString("uz-UZ")} so‘m`, "muted"));
-        if (student.billing_mode === "attendance") section.append(node("p", `Jadval bo‘yicha ${student.lesson_count} dars × ${Number(student.lesson_rate).toLocaleString("uz-UZ")} so‘m`, "muted"));
+        if (student.billing_mode === "attendance") {
+          section.append(node("p", `Oylik tarif: ${Number(student.monthly_amount || 0).toLocaleString("uz-UZ")} so‘m · davr: ${student.service_days}/${student.period_days} kalendar kun`, "muted"));
+        }
+        if (![3, 6].includes(Number(student.days_per_week)) && student.status !== "waived") {
+          section.append(node("p", "Bu jadval uchun standart tarif yo‘q. Tarifni tekshirib, kerak bo‘lsa to‘g‘rilang.", "muted"));
+          const tariff = makeForm("To‘liq oylik tarif", "Tarifni yangilash", formEl => {
+            const amount = Number(formValue(new FormData(formEl), "amount"));
+            if (!Number.isInteger(amount) || amount <= 0) throw new Error("Oylik tarifni musbat butun so‘mda kiriting.");
+            return runAdminAction("set_billing_tariff", { student_id: student.id, period: adminPeriod, amount });
+          });
+          tariff.insertBefore(makeField("So‘m", "amount", "number", student.monthly_amount || "", true, { min: 1, max: 2000000000, step: 1000 }), tariff.querySelector('[type="submit"]'));
+          section.append(tariff);
+        }
         if (student.due > 0 && student.status !== "waived") {
           const payment = makeForm("To‘lov kiritish", "To‘lovni saqlash", formEl => {
             const fd = new FormData(formEl); const amount = Number(formValue(fd, "amount"));

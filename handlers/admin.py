@@ -712,9 +712,12 @@ async def process_student_time(message: types.Message, state: FSMContext, db: Da
     billing_line = ""
     if billing and billing["billing_mode"] == "attendance":
         billing_line = (
-            f"\n🧾 Joriy oy avtomatik hisobi: <b>{billing['lesson_count']} dars × "
-            f"{_billing_money(billing['lesson_rate'])} = {_billing_money(billing['amount'])}</b>"
+            f"\n🧾 Joriy oy qarzi: <b>{_billing_money(billing['amount'])}</b> "
+            f"({billing['service_days']}/{billing['period_days']} kalendar kun, "
+            f"oylik tarif {_billing_money(billing['monthly_amount'] or 0)})"
         )
+    elif not billing:
+        billing_line = "\n🧾 Bu jadval uchun oylik tarifni qo'lda kiritish kerak."
     phone2_str = f"\n2-Telefon: {data.get('parent_phone_2')}" if data.get("parent_phone_2") else ""
     assign_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚗 Haydovchi biriktirish", callback_data=AssignStudentDriverCallback(student_id=student_id).pack())]
@@ -1897,7 +1900,11 @@ def _billing_list_keyboard(students: list, period: str, page: int) -> InlineKeyb
     rows = []
     for student in students[page * BILLING_PAGE_SIZE:(page + 1) * BILLING_PAGE_SIZE]:
         if student["invoice_id"] is None:
-            badge = "hisob yo'q"
+            badge = (
+                "tarif kerak" if student.get("days_per_week", 0) and not student.get("monthly_amount")
+                else "jadval yo'q" if not student.get("days_per_week", 0)
+                else "hisob yo'q"
+            )
         elif student["status"] == "waived":
             badge = "bekor qilingan"
         elif student["amount"] == 0 and student["due"] == 0:
@@ -1951,7 +1958,9 @@ def _billing_invoice_keyboard(student_id: int, period: str, amount: int | None =
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _billing_summary_keyboard(student_id: int, period: str, due: int) -> InlineKeyboardMarkup:
+def _billing_summary_keyboard(
+    student_id: int, period: str, due: int, manual_tariff: bool = False
+) -> InlineKeyboardMarkup:
     rows = []
     if due > 0:
         rows.append([InlineKeyboardButton(
@@ -1962,23 +1971,44 @@ def _billing_summary_keyboard(student_id: int, period: str, due: int) -> InlineK
             text="🎁 Chegirma kiritish",
             callback_data=BillingDiscountStartCallback(student_id=student_id, period=period).pack(),
         )])
+    if manual_tariff:
+        rows.append([InlineKeyboardButton(
+            text="✍️ Oylik tarifni tekshirish",
+            callback_data=BillingManualAmountCallback(student_id=student_id, period=period).pack(),
+        )])
     rows.append([InlineKeyboardButton(text="⬅️ Ro'yxat", callback_data=BillingListCallback(period=period).pack())])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _show_billing_list(message: types.Message, db: Database, period: str, page: int = 0, edit: bool = False):
+    await db.ensure_monthly_billing(period)
     students = await db.get_billing_students(period)
+    students.sort(key=lambda student: (
+        0 if student["invoice_id"] is not None and student["status"] != "waived" and student["due"] > 0
+        else 1 if student["invoice_id"] is None and student.get("days_per_week", 0) and not student.get("monthly_amount")
+        else 2 if student["invoice_id"] is None
+        else 3,
+        -max(0, int(student.get("due") or 0)),
+        str(student["full_name"]).casefold(),
+    ))
     entered = [student for student in students if student["invoice_id"] is not None]
     collected = sum(student["paid_total"] for student in entered)
     remaining = sum(max(0, student["due"] or 0) for student in entered)
+    debtors = sum(
+        1 for student in entered
+        if student["status"] != "waived" and student["due"] > 0
+    )
     text = (
         f"💰 <b>Oylik to'lovlar — {escape_html(period)}</b>\n\n"
         f"👥 Faol o'quvchilar: <b>{len(students)}</b>\n"
         f"🧾 Hisob ochilgan: <b>{len(entered)}</b>\n"
+        f"⏳ Qarzdorlar: <b>{debtors}</b>\n"
         f"✅ Jami tushgan: <b>{_billing_money(collected)}</b>\n"
         f"⏳ Qolgan to'lov: <b>{_billing_money(remaining)}</b>\n\n"
-        "Hisoblar o'quvchi qo'shilganda va har oy boshida dars jadvali bo'yicha avtomatik ochiladi. "
-        "O'quvchi kelmagan kunlari ham rejalashtirilgan darslar hisoblanadi."
+        "Qarz qatnovlar soniga qarab emas, o'quvchi ro'yxatga olingan kundan oy oxirigacha "
+        "oylik tarifga mutanosib hisoblanadi. O'quvchi darsga kelmagan kunlar ham hisobga kiradi. "
+        "3 kunlik haftalik tarif — 60 000 so'm, 6 kunlik — 120 000 so'm; boshqa jadval uchun "
+        "oylik tarifni qo'lda kiriting."
     )
     keyboard = _billing_list_keyboard(students, period, page)
     if edit:
@@ -1988,6 +2018,7 @@ async def _show_billing_list(message: types.Message, db: Database, period: str, 
 
 
 async def _show_billing_student(message: types.Message, db: Database, student_id: int, period: str, edit: bool = True):
+    await db.ensure_monthly_billing(period)
     student = await db.get_student_by_id(student_id)
     if not student or not student.get("is_active"):
         await safe_telegram_call(message.answer, "Faol o'quvchi topilmadi.")
@@ -2002,16 +2033,31 @@ async def _show_billing_student(message: types.Message, db: Database, student_id
     period_text = escape_html(period)
     if summary is None:
         days = listed_student["days_per_week"]
+        has_schedule = bool(days)
+        monthly_amount = listed_student.get("monthly_amount")
+        detail = (
+            "Bu jadval uchun oylik tarif kiritilmagan. To'liq oylik summani kiriting; "
+            "joriy oy qarzi ro'yxatdan o'tgan kundan oy oxirigacha hisoblanadi."
+            if has_schedule and not monthly_amount else
+            "Faol dars jadvali topilmadi. Avval o'quvchining dars kunlarini kiriting."
+            if not has_schedule else
+            "Hisob tayyorlanmadi. Jadval va oylik tarif ma'lumotlarini tekshiring."
+        )
         text = (
             f"👤 <b>{name}</b>\n📅 Oy: <b>{period_text}</b>\n"
             f"🗓 Haftasiga dars kuni: <b>{days}</b>\n\n"
-            "Hisob o'quvchi ro'yxatga qo'shilganda va keyingi oy boshida jadval bo'yicha avtomatik yaratiladi. "
-            "Bu davr uchun hisob topilmadi; dars jadvalini tekshiring."
+            f"{escape_html(detail)}"
         )
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="⬅️ Ro'yxat", callback_data=BillingListCallback(period=period).pack())
-        ]])
+        rows = []
+        if has_schedule:
+            rows.append([InlineKeyboardButton(
+                text="✍️ Oylik tarifni kiritish",
+                callback_data=BillingManualAmountCallback(student_id=student_id, period=period).pack(),
+            )])
+        rows.append([InlineKeyboardButton(text="⬅️ Ro'yxat", callback_data=BillingListCallback(period=period).pack())])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
     else:
+        needs_manual_tariff = listed_student["days_per_week"] not in (3, 6)
         status = "bekor qilingan" if summary["status"] == "waived" else (
             "hozircha qarz yo'q" if summary["amount"] == 0 and summary["due"] == 0 else
             "to'langan" if summary["due"] == 0 else "to'lanmagan / qisman to'langan"
@@ -2019,8 +2065,13 @@ async def _show_billing_student(message: types.Message, db: Database, student_id
         text = (
             f"👤 <b>{name}</b>\n📅 Oy: <b>{period_text}</b>\n\n"
             + (
-                f"🗓 Rejadagi darslar: <b>{summary['lesson_count']} × {_billing_money(summary['lesson_rate'])}</b>\n"
+                f"📆 To'liq oylik tarif: <b>{_billing_money(summary['monthly_amount'] or 0)}</b>\n"
+                f"🧮 Joriy oy hisobi: <b>{summary['service_days']}/{summary['period_days']} kalendar kuniga mutanosib</b>\n"
                 if summary["billing_mode"] == "attendance" else ""
+            )
+            + (
+                "⚠️ Bu haftalik jadval uchun standart tarif yo'q. Oylik tarifni tekshiring va kerak bo'lsa to'g'rilang.\n"
+                if needs_manual_tariff and summary["status"] != "waived" else ""
             )
             + f"💳 Hisob summasi: <b>{_billing_money(summary['amount'])}</b>\n"
             f"🎁 Chegirma: <b>{_billing_money(summary['discount'])}</b>\n"
@@ -2028,7 +2079,10 @@ async def _show_billing_student(message: types.Message, db: Database, student_id
             f"⏳ Qolgan: <b>{_billing_money(max(0, summary['due']))}</b>\n"
             f"📌 Holati: <b>{status}</b>"
         )
-        keyboard = _billing_summary_keyboard(student_id, period, max(0, summary["due"]))
+        keyboard = _billing_summary_keyboard(
+            student_id, period, max(0, summary["due"]),
+            manual_tariff=needs_manual_tariff and summary["status"] != "waived",
+        )
     if edit:
         await safe_telegram_call(message.edit_text, text, reply_markup=keyboard, parse_mode="HTML")
     else:
@@ -2100,16 +2154,39 @@ async def cb_billing_manual_amount(callback: types.CallbackQuery, state: FSMCont
         await callback.answer("Ruxsat yo'q", show_alert=True)
         return
     await state.clear()
-    await callback.answer("To'lov dars jadvali bo'yicha avtomatik hisoblanadi.", show_alert=True)
+    await state.update_data(student_id=callback_data.student_id, period=callback_data.period)
+    await state.set_state(BillingStates.waiting_for_invoice_amount)
+    await safe_telegram_call(
+        callback.message.edit_text,
+        "Oylik <b>to'liq tarifni</b> so'mda kiriting. Masalan: <code>60000</code>.\n"
+        "Joriy oy qarzi ro'yxatga olingan kundan oy oxirigacha kalendar kunlariga mutanosib hisoblanadi.",
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 @admin_router.message(BillingStates.waiting_for_invoice_amount, F.text)
 async def process_billing_invoice_amount(message: types.Message, state: FSMContext, db: Database):
     if not is_admin(message.from_user.id):
         return
+    raw = (message.text or "").strip().replace(" ", "").replace("\u00a0", "").replace(",", "")
+    if not raw.isdigit() or not 0 < int(raw) <= 2_000_000_000:
+        await message.answer("Summani musbat butun son qilib kiriting. Masalan: 60000.")
+        return
     data = await state.get_data()
+    ok, reason = await db.set_billing_plan_amount(
+        int(data["student_id"]), str(data["period"]), int(raw), message.from_user.id
+    )
     await state.clear()
-    await message.answer("Oylik summa dars jadvali bo'yicha avtomatik hisoblanadi.")
+    if not ok:
+        reply = {
+            "no_schedule": "O'quvchining faol dars jadvali topilmadi.",
+            "waived": "Bu oy hisobi bekor qilingan; tarifni hisobga qo'llab bo'lmaydi.",
+            "manual_invoice": "Bu oy uchun qo'lda ochilgan hisob bor; tarifni unga qo'llab bo'lmaydi.",
+        }.get(reason, "Oylik tarif saqlanmadi.")
+        await message.answer(reply)
+        return
+    await message.answer("✅ Oylik tarif saqlandi, joriy oy qarzi qayta hisoblandi.")
     await _show_billing_student(message, db, data["student_id"], data["period"], edit=False)
 
 

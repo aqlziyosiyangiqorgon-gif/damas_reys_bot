@@ -224,7 +224,7 @@ class SchedulerService:
         return stats
 
     async def run_monthly_billing(self, period: Optional[str] = None) -> Dict[str, int]:
-        """Open missing invoices from scheduled lessons, independent of attendance."""
+        """Create or reconcile monthly invoices by enrollment date and calendar days."""
         result = await self.db.ensure_monthly_billing(period)
         if result["created"]:
             logger.info("Avtomatik dars hisoblari yaratildi: %s ta", result["created"])

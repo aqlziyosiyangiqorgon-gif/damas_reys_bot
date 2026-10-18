@@ -143,21 +143,17 @@ h1 { margin: 0; color: var(--brand-navy); font-size: 17px; font-weight: 780; let
 .welcome-card .eyebrow { color: #d5e3ee; }
 .welcome-card .muted { color: #c7d8e5; }
 .welcome-card h2 { margin: 5px 0 7px; color: #fff; font-size: clamp(20px, 5vw, 24px); line-height: 1.2; letter-spacing: -.035em; }
-.welcome-icon {
+.welcome-vehicle {
   position: relative;
-  z-index: 1;
-  display: grid;
-  width: 64px;
-  height: 64px;
-  flex: 0 0 64px;
-  place-items: center;
-  margin-left: 12px;
-  border: 1px solid rgba(255, 255, 255, .32);
-  border-radius: 22px;
-  background: linear-gradient(145deg, #ffc94e, var(--brand-orange));
-  box-shadow: 0 7px 17px rgba(0, 0, 0, .16);
-  font-size: 34px;
-  transform: rotate(3deg);
+  z-index: 2;
+  display: block;
+  width: clamp(110px, 32vw, 154px);
+  height: clamp(64px, 22vw, 96px);
+  flex: 0 0 clamp(110px, 32vw, 154px);
+  margin-left: 5px;
+  object-fit: contain;
+  object-position: center;
+  filter: drop-shadow(0 8px 8px rgba(0, 0, 0, .2));
 }
 
 .muted { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
@@ -435,7 +431,7 @@ footer { padding: 23px 6px 5px; color: #83919c; text-align: center; font-size: 1
 @media (max-width: 360px) {
   .app-shell { padding-right: 14px; padding-left: 14px; }
   .welcome-card { min-height: 136px; padding: 18px; }
-  .welcome-icon { width: 54px; height: 54px; flex-basis: 54px; border-radius: 19px; font-size: 29px; }
+  .welcome-vehicle { width: 96px; height: 64px; flex-basis: 96px; margin-left: 2px; }
   .card { padding: 15px; }
   .action-button { padding-right: 12px; padding-left: 12px; }
   .brand-logo-frame { width: min(154px, 100%); height: 44px; }

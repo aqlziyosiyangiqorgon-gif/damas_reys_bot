@@ -165,6 +165,7 @@ async def _staff_dashboard(db, telegram_id: int, date_str: str) -> dict[str, Any
 
 
 async def _admin_dashboard(db, date_str: str, period: str) -> dict[str, Any]:
+    await db.ensure_monthly_billing(period)
     students = await db.get_admin_students()
     trips = await db.get_trips_by_date(date_str)
     unapproved = await db.get_unapproved_trips(date_str)
@@ -628,10 +629,13 @@ async def admin_action(request: web.Request) -> web.Response:
             raise MiniAppRequestError(str(exc), 400)
         summary = await db.get_invoice_summary(student_id, now_tz().strftime("%Y-%m"))
         billing_note = (
-            f" Avtomatik hisob: {summary['lesson_count']} dars × "
-            f"{summary['lesson_rate']:,} = {summary['amount']:,} so'm."
+            f" Joriy oy qarzi: {summary['amount']:,} so'm "
+            f"({summary['service_days']}/{summary['period_days']} kalendar kun; "
+            f"oylik tarif {(summary['monthly_amount'] or 0):,} so'm)."
             if summary and summary["billing_mode"] == "attendance" else ""
         )
+        if not summary:
+            billing_note = " Bu haftalik jadval uchun oylik tarifni qo'lda kiritish kerak."
         result = {"message": f"{full_name} o'quvchi va dars jadvali saqlandi.{billing_note}"}
 
     elif kind == "update_student":
@@ -730,15 +734,33 @@ async def admin_action(request: web.Request) -> web.Response:
             raise MiniAppRequestError("Mahalla topilmadi.", 404)
         result = {"message": "Mahalla ma'lumotlari saqlandi."}
 
+    elif kind == "set_billing_tariff":
+        student_id = _admin_int(body, "student_id", minimum=1)
+        period = _valid_period(body.get("period"))
+        amount = _admin_int(body, "amount", minimum=1, maximum=2_000_000_000)
+        ok, reason = await db.set_billing_plan_amount(student_id, period, amount, telegram_id)
+        if not ok:
+            message = {
+                "no_schedule": "O'quvchida faol dars jadvali yo'q.",
+                "waived": "Bu oy hisobi bekor qilingan; tarifni unga qo'llab bo'lmaydi.",
+                "manual_invoice": "Bu oy uchun qo'lda ochilgan hisob bor; tarifni unga qo'llab bo'lmaydi.",
+            }.get(reason, "Oylik tarif saqlanmadi.")
+            raise MiniAppRequestError(message, 409)
+        summary = await db.get_invoice_summary(student_id, period)
+        result = {"message": (
+            f"Oylik tarif saqlandi. Shu oy uchun qarz {summary['amount']:,} so'm qilib qayta hisoblandi."
+            if summary else "Oylik tarif saqlandi."
+        )}
+
     elif kind == "create_invoice":
         student_id = _admin_int(body, "student_id", minimum=1)
         period = _valid_period(body.get("period"))
         await db.ensure_monthly_billing(period)
         summary = await db.get_invoice_summary(student_id, period)
         if not summary:
-            raise MiniAppRequestError("Bu davr uchun dars jadvali yoki hisob topilmadi.", 404)
+            raise MiniAppRequestError("Bu davr uchun hisob yo'q. Dars jadvali va tarifni tekshiring.", 404)
         result = {"message": (
-            "Hisob dars jadvali bo'yicha avtomatik tayyorlandi."
+            "Hisob oylik tarif va ro'yxatga olingan sanaga qarab avtomatik tayyorlandi."
             if summary["billing_mode"] == "attendance" else "Bu davr uchun hisob avvaldan mavjud."
         )}
 

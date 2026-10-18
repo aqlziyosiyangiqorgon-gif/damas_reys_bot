@@ -6,7 +6,7 @@ import calendar
 from datetime import date, datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from models.enums import UserRole
-from services.billing import LESSON_RATE
+from services.billing import LESSON_RATE, prorated_amount, tariff_for_days
 from utils.time_validation import validate_schedule_times
 
 # Boshlang'ich zonalar va ularga tegishli 10 ta mahalla
@@ -386,21 +386,24 @@ class Database:
         period: str,
         effective_from: date,
         weekdays: set[int],
+        monthly_amount: int,
     ) -> bool:
-        """Create a scheduled-lesson invoice, charging 5,000 so'm per planned class."""
-        if not weekdays:
+        """Reconcile an automatic invoice to the remaining calendar days of the month."""
+        if not weekdays or monthly_amount <= 0:
             return False
         period_start, period_end = self._billing_period_dates(period)
         if effective_from > period_end:
             return False
 
         cur = await conn.execute(
-            "SELECT id, billing_mode FROM invoices WHERE student_id = ? AND period = ?",
+            "SELECT id, billing_mode, status FROM invoices WHERE student_id = ? AND period = ?",
             (student_id, period),
         )
         existing_invoice = await cur.fetchone()
         if existing_invoice and existing_invoice["billing_mode"] != "attendance":
             # Old/manual invoices are preserved without layering a second charge on them.
+            return False
+        if existing_invoice and existing_invoice["status"] == "waived":
             return False
 
         if existing_invoice:
@@ -414,6 +417,14 @@ class Database:
             invoice_id = int(cur.lastrowid)
 
         charge_from = max(period_start, effective_from)
+        period_days = (period_end - period_start).days + 1
+        service_days = (period_end - charge_from).days + 1
+        # Attendance is not the billing basis: the monthly tariff applies from
+        # enrollment through month-end, including days when a student is absent.
+        amount = prorated_amount(monthly_amount, service_days, period_days)
+
+        # Keep schedule dates as informational records only. They no longer set
+        # the invoice amount.
         max_lesson_days = len(weekdays) * 4
         cur = await conn.execute(
             "SELECT lesson_date FROM invoice_lesson_days WHERE invoice_id = ?", (invoice_id,)
@@ -438,11 +449,6 @@ class Database:
             )
 
         cur = await conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) FROM invoice_lesson_days WHERE invoice_id = ?",
-            (invoice_id,),
-        )
-        amount = int((await cur.fetchone())[0])
-        cur = await conn.execute(
             "SELECT discount FROM invoices WHERE id = ?", (invoice_id,)
         )
         discount = int((await cur.fetchone())[0])
@@ -450,6 +456,9 @@ class Database:
             "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = ?", (invoice_id,)
         )
         paid_total = int((await cur.fetchone())[0])
+        # Reconciliation must never make already-recorded payments or discounts
+        # exceed the invoice total.
+        amount = max(amount, paid_total + discount)
         status = "paid" if paid_total >= amount - discount else "unpaid"
         await conn.execute(
             "UPDATE invoices SET amount = ?, status = ? WHERE id = ?",
@@ -473,14 +482,15 @@ class Database:
             return False
 
         cur = await conn.execute(
-            "SELECT id, effective_from FROM billing_plans WHERE student_id = ? "
+            "SELECT id, effective_from, monthly_amount FROM billing_plans WHERE student_id = ? "
             "AND effective_from <= ? ORDER BY effective_from DESC, id DESC LIMIT 1",
             (student_id, effective_from.isoformat()),
         )
         plan = await cur.fetchone()
         days_per_week = len(weekdays)
-        monthly_amount = days_per_week * 4 * LESSON_RATE
+        monthly_amount = tariff_for_days(days_per_week)
         if plan is None:
+            monthly_amount = monthly_amount or 0
             await conn.execute(
                 "INSERT INTO billing_plans "
                 "(student_id, days_per_week, monthly_amount, effective_from, created_by, created_at) "
@@ -491,12 +501,16 @@ class Database:
             plan_start = effective_from
         else:
             plan_start = date.fromisoformat(plan["effective_from"])
+            # Existing plans may contain a tariff entered by an administrator.
+            monthly_amount = int(plan["monthly_amount"])
 
         period = effective_from.strftime("%Y-%m")
-        return await self._ensure_attendance_invoice(conn, student_id, period, plan_start, weekdays)
+        return await self._ensure_attendance_invoice(
+            conn, student_id, period, plan_start, weekdays, monthly_amount
+        )
 
     async def ensure_monthly_billing(self, period: Optional[str] = None) -> Dict[str, int]:
-        """Ensure active students have the current period's automatic lesson invoice."""
+        """Ensure active students have an invoice prorated by their month service period."""
         today = now_tz().date()
         period = period or today.strftime("%Y-%m")
         period_start, period_end = self._billing_period_dates(period)
@@ -520,7 +534,7 @@ class Database:
                     continue
 
                 cur_plan = await conn.execute(
-                    "SELECT effective_from FROM billing_plans WHERE student_id = ? "
+                    "SELECT effective_from, monthly_amount FROM billing_plans WHERE student_id = ? "
                     "AND effective_from <= ? ORDER BY effective_from DESC, id DESC LIMIT 1",
                     (student_id, period_end.isoformat()),
                 )
@@ -529,22 +543,90 @@ class Database:
                     # Older records have no enrollment timestamp; start fairly from today.
                     effective_from = max(today, period_start)
                     days_per_week = len(weekdays)
+                    monthly_amount = tariff_for_days(days_per_week) or 0
                     await conn.execute(
                         "INSERT INTO billing_plans "
                         "(student_id, days_per_week, monthly_amount, effective_from, created_by, created_at) "
                         "VALUES (?, ?, ?, ?, 0, ?)",
-                        (student_id, days_per_week, days_per_week * 4 * LESSON_RATE,
+                        (student_id, days_per_week, monthly_amount,
                          effective_from.isoformat(), now_tz().strftime("%Y-%m-%d %H:%M:%S")),
                     )
                 else:
                     effective_from = date.fromisoformat(plan["effective_from"])
+                    monthly_amount = int(plan["monthly_amount"])
 
                 if await self._ensure_attendance_invoice(
-                    conn, student_id, period, effective_from, weekdays
+                    conn, student_id, period, effective_from, weekdays, monthly_amount
                 ):
                     created += 1
+                elif monthly_amount <= 0:
+                    skipped += 1
             await conn.commit()
             return {"created": created, "skipped": skipped}
+        except BaseException:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
+
+    async def set_billing_plan_amount(
+        self, student_id: int, period: str, monthly_amount: int, created_by: int
+    ) -> Tuple[bool, str]:
+        """Save a full-month tariff and reconcile the selected month's invoice."""
+        if type(monthly_amount) is not int or monthly_amount <= 0:
+            return False, "invalid_amount"
+        period_start, period_end = self._billing_period_dates(period)
+        conn = await self.get_connection()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            cur = await conn.execute(
+                "SELECT weekday FROM schedules WHERE student_id = ? ORDER BY weekday",
+                (student_id,),
+            )
+            weekdays = {int(row[0]) for row in await cur.fetchall()}
+            if not weekdays:
+                await conn.rollback()
+                return False, "no_schedule"
+
+            cur = await conn.execute(
+                "SELECT status, billing_mode FROM invoices WHERE student_id = ? AND period = ?",
+                (student_id, period),
+            )
+            invoice = await cur.fetchone()
+            if invoice and invoice["status"] == "waived":
+                await conn.rollback()
+                return False, "waived"
+            if invoice and invoice["billing_mode"] != "attendance":
+                await conn.rollback()
+                return False, "manual_invoice"
+
+            cur = await conn.execute(
+                "SELECT id, effective_from FROM billing_plans WHERE student_id = ? "
+                "AND effective_from <= ? ORDER BY effective_from DESC, id DESC LIMIT 1",
+                (student_id, period_end.isoformat()),
+            )
+            plan = await cur.fetchone()
+            if plan is None:
+                effective_from = period_start
+                await conn.execute(
+                    "INSERT INTO billing_plans "
+                    "(student_id, days_per_week, monthly_amount, effective_from, created_by, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (student_id, len(weekdays), monthly_amount, effective_from.isoformat(), created_by,
+                     now_tz().strftime("%Y-%m-%d %H:%M:%S")),
+                )
+            else:
+                effective_from = date.fromisoformat(plan["effective_from"])
+                await conn.execute(
+                    "UPDATE billing_plans SET days_per_week = ?, monthly_amount = ? WHERE id = ?",
+                    (len(weekdays), monthly_amount, plan["id"]),
+                )
+
+            await self._ensure_attendance_invoice(
+                conn, student_id, period, effective_from, weekdays, monthly_amount
+            )
+            await conn.commit()
+            return True, "ok"
         except BaseException:
             await conn.rollback()
             raise
@@ -3035,6 +3117,7 @@ class Database:
             await conn.close()
 
     async def get_invoice_summary(self, student_id: int, period: str) -> Optional[Dict[str, Any]]:
+        period_start, period_end = self._billing_period_dates(period)
         conn = await self.get_connection()
         try:
             cur = await conn.execute(
@@ -3052,6 +3135,16 @@ class Database:
                 "SELECT COUNT(*) FROM invoice_lesson_days WHERE invoice_id = ?", (invoice["id"],)
             )
             lesson_count = int((await cur.fetchone())[0])
+            cur = await conn.execute(
+                "SELECT monthly_amount, effective_from FROM billing_plans WHERE student_id = ? "
+                "AND effective_from <= ? ORDER BY effective_from DESC, id DESC LIMIT 1",
+                (student_id, period_end.isoformat()),
+            )
+            plan = await cur.fetchone()
+            monthly_amount = int(plan["monthly_amount"]) if plan else None
+            effective_from = date.fromisoformat(plan["effective_from"]) if plan else None
+            service_from = max(period_start, effective_from) if effective_from else period_start
+            service_days = max(0, (period_end - service_from).days + 1)
             return {
                 "id": invoice["id"],
                 "amount": invoice["amount"],
@@ -3060,37 +3153,57 @@ class Database:
                 "billing_mode": invoice["billing_mode"],
                 "lesson_count": lesson_count,
                 "lesson_rate": LESSON_RATE if invoice["billing_mode"] == "attendance" else None,
-                "due": invoice["amount"] - invoice["discount"] - paid_total,
+                "monthly_amount": monthly_amount,
+                "service_days": service_days,
+                "period_days": (period_end - period_start).days + 1,
+                "due": 0 if invoice["status"] == "waived" else max(
+                    0, invoice["amount"] - invoice["discount"] - paid_total
+                ),
                 "status": invoice["status"],
             }
         finally:
             await conn.close()
 
     async def get_billing_students(self, period: str) -> List[Dict[str, Any]]:
-        """List active students with this month's invoice status and schedule count."""
+        """List active students with this month's invoice, tariff, and schedule status."""
+        _period_start, period_end = self._billing_period_dates(period)
         conn = await self.get_connection()
         try:
             cur = await conn.execute(
                 """
                 SELECT s.id, s.full_name, COUNT(DISTINCT sch.weekday) AS days_per_week,
+                       bp.monthly_amount, bp.effective_from,
                        i.id AS invoice_id, i.amount, i.discount, i.status, i.billing_mode,
                        COALESCE((SELECT COUNT(*) FROM invoice_lesson_days ild WHERE ild.invoice_id = i.id), 0) AS lesson_count,
                        COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id = i.id), 0) AS paid_total
                 FROM students s
                 LEFT JOIN schedules sch ON sch.student_id = s.id
                 LEFT JOIN invoices i ON i.student_id = s.id AND i.period = ?
+                LEFT JOIN billing_plans bp ON bp.id = (
+                    SELECT p.id FROM billing_plans p
+                    WHERE p.student_id = s.id AND p.effective_from <= ?
+                    ORDER BY p.effective_from DESC, p.id DESC LIMIT 1
+                )
                 WHERE s.is_active = 1
-                GROUP BY s.id, s.full_name, i.id, i.amount, i.discount, i.status
+                GROUP BY s.id, s.full_name, bp.id, i.id, i.amount, i.discount, i.status
                 ORDER BY s.full_name COLLATE NOCASE
                 """,
-                (period,),
+                (period, period_end.isoformat()),
             )
             rows = [dict(row) for row in await cur.fetchall()]
+            period_start, period_end = self._billing_period_dates(period)
+            period_days = (period_end - period_start).days + 1
             for row in rows:
+                plan_start = date.fromisoformat(row["effective_from"]) if row.get("effective_from") else None
+                service_start = max(period_start, plan_start) if plan_start else period_start
+                row["service_days"] = max(0, (period_end - service_start).days + 1)
+                row["period_days"] = period_days
                 if row["invoice_id"] is None:
                     row.update({"paid_total": 0, "due": None, "lesson_rate": None})
                 else:
-                    row["due"] = row["amount"] - row["discount"] - row["paid_total"]
+                    row["due"] = 0 if row["status"] == "waived" else max(
+                        0, row["amount"] - row["discount"] - row["paid_total"]
+                    )
                     row["lesson_rate"] = LESSON_RATE if row["billing_mode"] == "attendance" else None
             return rows
         finally:

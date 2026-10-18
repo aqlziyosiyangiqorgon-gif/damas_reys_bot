@@ -23,7 +23,6 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Flowable, Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from database.db import Database
-from services.billing import LESSON_RATE
 from services.telegram_safe import safe_send_document
 
 logger = logging.getLogger(__name__)
@@ -184,8 +183,10 @@ def build_payment_receipt_pdf(data: dict[str, Any]) -> bytes:
     if int(data.get("discount") or 0) > 0:
         breakdown.append([Paragraph("Chegirma", label_style), Paragraph(_p("- " + _money(data["discount"])), value_style)])
     if str(data.get("billing_mode")) == "attendance":
-        lesson_line = f"Reja bo'yicha darslar: {int(data.get('lesson_count') or 0)} ta x {_money(LESSON_RATE)}"
-        breakdown.append([Paragraph("Hisoblash", label_style), Paragraph(_p(lesson_line), value_style)])
+        breakdown.append([
+            Paragraph("Hisoblash", label_style),
+            Paragraph(_p("Oylik tarif bo'yicha avtomatik hisob"), value_style),
+        ])
     breakdown.extend([
         [Paragraph("Oldingi to'lovlar", label_style), Paragraph(_p(_money(data.get("paid_before"))), value_style)],
         [Paragraph("Ushbu chek summasi", value_style), Paragraph(_p(_money(data.get("payment_amount"))), value_style)],
