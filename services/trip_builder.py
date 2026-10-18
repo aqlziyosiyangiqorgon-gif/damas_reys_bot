@@ -14,7 +14,9 @@ def time_to_minutes(time_str: str) -> int:
     return int(parts[0]) * 60 + int(parts[1])
 
 def minutes_to_time(minutes: int) -> str:
-    minutes = minutes % (24 * 60)
+    # Manfiy yoki 24 soatdan katta qiymatni indamay o'ramaymiz (kechagi kunga o'tib ketardi).
+    if minutes < 0 or minutes >= 24 * 60:
+        raise ValueError("Vaqt 00:00 - 23:59 oralig'ida bo'lishi kerak")
     h = minutes // 60
     m = minutes % 60
     return f"{h:02d}:{m:02d}"
@@ -87,7 +89,14 @@ class TripBuilder:
             zones_map.items(), key=lambda item: (item[0][0], item[0][1] or 0)
         ):
             # A) Kelish reyslari (to_center)
-            center_trips = self._build_to_center_trips(zone_id, zone_schedules)
+            try:
+                center_trips = self._build_to_center_trips(zone_id, zone_schedules)
+            except ValueError:
+                warnings.append(
+                    f"⚠️ {zone_id}-zona: olib kelish vaqti 00:00 dan oldin chiqadi. "
+                    "Erta dars vaqtini yoki yo'l vaqtini tekshiring. Bu zona uchun kelish reyslari yaratilmadi."
+                )
+                center_trips = []
             all_trips.extend(center_trips)
 
             # B) Qaytish reyslari (to_home)

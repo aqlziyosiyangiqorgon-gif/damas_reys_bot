@@ -22,6 +22,26 @@ from services.telegram_safe import safe_send, safe_send_document
 
 logger = logging.getLogger(__name__)
 
+
+def _online_backup_sync(source: str, tmp: str, dest: str) -> None:
+    """Sinxron SQLite online backup. Faqat asyncio.to_thread ichidan chaqiriladi."""
+    import sqlite3
+    try:
+        src_conn = sqlite3.connect(source)
+        try:
+            dst_conn = sqlite3.connect(tmp)
+            try:
+                src_conn.backup(dst_conn)
+            finally:
+                dst_conn.close()
+        finally:
+            src_conn.close()
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 class SchedulerService:
     def __init__(self, db: Database, bot: Optional[Bot] = None, tz_str: str = settings.TIMEZONE):
         self.db = db
@@ -246,23 +266,9 @@ class SchedulerService:
         if not os.path.exists(source):
             raise FileNotFoundError(f"Ma'lumotlar bazasi topilmadi: {source}")
 
-        # WAL-xavfsiz online nusxa, so'ngra atomik almashtirish.
-        import sqlite3
+        # WAL-xavfsiz online nusxa. Sinxron I/O botni bloklamasligi uchun fonda bajariladi.
         tmp = dest + ".tmp"
-        try:
-            src_conn = sqlite3.connect(source)
-            try:
-                dst_conn = sqlite3.connect(tmp)
-                try:
-                    src_conn.backup(dst_conn)
-                finally:
-                    dst_conn.close()
-            finally:
-                src_conn.close()
-            os.replace(tmp, dest)
-        finally:
-            if os.path.exists(tmp):
-                os.remove(tmp)
+        await asyncio.to_thread(_online_backup_sync, source, tmp, dest)
         logger.info("Baza zaxiralandi: %s", dest)
 
         # Keep only the configured retention period of dated local snapshots.

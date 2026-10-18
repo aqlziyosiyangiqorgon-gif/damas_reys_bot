@@ -23,9 +23,10 @@ async def test_phase_1_full_verification():
         expected_tables = {
             "zones", "villages", "drivers", "staff", "students", "schedules",
             "parents", "student_parents", "absences", "trips", "trip_items",
-            "event_log", "notify_log", "broadcasts", "fsm_storage", "workflow_payloads"
+            "event_log", "notify_log", "broadcasts", "fsm_storage", "workflow_payloads",
+            "billing_plans", "invoices", "payments", "discount_log"
         }
-        assert len(tables) == 16
+        assert len(tables) == 20
         assert set(tables) == expected_tables
 
         # 3. 10 ta mahalla va 4 ta zona

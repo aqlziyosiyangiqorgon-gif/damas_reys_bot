@@ -42,10 +42,12 @@ Zaxiralar bot serveridagi lokal fayllardir; Railway'da saqlanib qolishi uchun `B
 
 1. GitHub repozitoriyadan Railway service yarating.
 2. Service Variables bo'limida `BOT_TOKEN`, `ADMIN_IDS`, `DB_PATH`, `BACKUP_DIR` va kerakli ish sozlamalarini kiriting.
-3. Railway Volume'ni `/app/data` manziliga ulang. `DB_PATH=/app/data/damas_reys.db` va `BACKUP_DIR=/app/data/backups`dan foydalaning.
+3. Railway service'ga Volume ulang va mount yo'lini `/app/data` qiling. Railway bu Volume ulanganda `RAILWAY_VOLUME_MOUNT_PATH` qiymatini o'zi beradi. `DB_PATH=/app/data/damas_reys.db` va `BACKUP_DIR=/app/data/backups` bo'lsin.
 4. Service'ni **bitta replica** bilan ishlating. `Procfile` worker jarayonini `python main.py` orqali ishga tushiradi.
 
-Deploydan keyin loglarda token yoki maxfiy qiymatlarni ulashmang. Volume yo'li noto'g'ri bo'lsa SQLite va backup fayllari deploylar orasida saqlanmasligi mumkin.
+Deploydan oldin eski SQLite faylni Volume ichiga ko'chiring yoki tiklang. Bot Railway'da Volume ulanmagan, `DB_PATH` Volume tashqarisida yoki unda mavjud yaroqli baza bo'lmasa, bo'sh baza yaratib ishga tushmaydi. Shu himoya noto'g'ri yo'ldan foydalanib o'quvchilar ro'yxati yo'qolgandek ko'rinishini to'xtatadi. Railway'da Volume'ga yozilmagan fayllar deploylar orasida saqlanmaydi.
+
+Volume sozlash bo'yicha ko'rsatma: [Railway Volumes](https://docs.railway.com/volumes).
 
 ## Asosiy admin buyruqlari
 

@@ -437,6 +437,11 @@ async def process_absence_reason(message: types.Message, state: FSMContext, db: 
     if message.bot:
         await _notify_center_admin_absence(message.bot, info, reason)
 
+@parent_router.message(ParentStates.waiting_for_absence_reason, ~F.text)
+async def reject_non_text_absence_reason(message: types.Message):
+    """Sabab kutilayotganda rasm/stiker/ovoz kelsa, bot jim qolmasin."""
+    await message.answer("Iltimos, sababni faqat matn ko'rinishida yozib yuboring.")
+
 # --- 8. Mavjud inline tugma orqali kelmaslikni belgilash (Phase 8 test mosligi) ---
 @parent_router.callback_query(AbsentButtonCallback.filter())
 async def cb_student_absent(callback: types.CallbackQuery, db: Database, callback_data: AbsentButtonCallback | None = None):

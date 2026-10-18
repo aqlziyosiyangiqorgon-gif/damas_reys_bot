@@ -240,3 +240,49 @@ class AdminNavigationCallback(CallbackData, prefix="admin_nav"):
     target: str
 
 
+class BillingStudentCallback(CallbackData, prefix="bill_s"):
+    student_id: int
+    period: str
+
+
+class BillingPageCallback(CallbackData, prefix="bill_p"):
+    page: int
+    period: str
+
+
+class BillingPeriodCallback(CallbackData, prefix="bill_m"):
+    period: str
+    move: Literal["p", "n"]
+
+
+class BillingInvoiceCallback(CallbackData, prefix="bill_i"):
+    student_id: int
+    amount: int
+    period: str
+
+
+class BillingManualAmountCallback(CallbackData, prefix="bill_manual"):
+    student_id: int
+    period: str
+
+
+class BillingListCallback(CallbackData, prefix="bill_l"):
+    period: str
+
+
+class BillingPaymentStartCallback(CallbackData, prefix="bill_pay"):
+    student_id: int
+    period: str
+
+
+class BillingDiscountStartCallback(CallbackData, prefix="bill_disc"):
+    student_id: int
+    period: str
+
+
+class BillingPaymentMethodCallback(CallbackData, prefix="bill_method"):
+    student_id: int
+    period: str
+    method: Literal["cash", "card"]
+
+

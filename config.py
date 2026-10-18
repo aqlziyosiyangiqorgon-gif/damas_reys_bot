@@ -1,4 +1,6 @@
 import os
+import sqlite3
+from pathlib import Path
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
@@ -13,20 +15,46 @@ def _project_path(path: str) -> str:
 
 
 def get_default_db_path() -> str:
+    volume_mount = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    if volume_mount:
+        return os.path.join(volume_mount, "damas_reys.db")
     env_db = os.getenv("DB_PATH")
     if env_db:
         return _project_path(env_db)
+    if is_railway_runtime():
+        return "/app/data/damas_reys.db"
     if os.path.isdir("/app/data"):
         return "/app/data/damas_reys.db"
     return os.path.join(BASE_DIR, "damas_reys.db")
 
 def get_default_backup_dir() -> str:
+    volume_mount = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    if volume_mount:
+        return os.path.join(volume_mount, "backups")
     env_bdir = os.getenv("BACKUP_DIR")
     if env_bdir:
         return _project_path(env_bdir)
+    if is_railway_runtime():
+        return "/app/data/backups"
     if os.path.isdir("/app/data"):
         return "/app/data/backups"
     return os.path.join(BASE_DIR, "backups")
+
+
+def is_railway_runtime() -> bool:
+    """Detect Railway using its runtime-provided service variables."""
+    return any(os.getenv(name) for name in (
+        "RAILWAY_ENVIRONMENT", "RAILWAY_PROJECT_ID", "RAILWAY_SERVICE_ID"
+    ))
+
+
+def _path_is_within(path: str, directory: str) -> bool:
+    path = os.path.realpath(os.path.abspath(path))
+    directory = os.path.realpath(os.path.abspath(directory))
+    try:
+        return os.path.normcase(os.path.commonpath((path, directory))) == os.path.normcase(directory)
+    except ValueError:
+        return False
 
 class Settings(BaseSettings):
     BOT_TOKEN: str = "YOUR_BOT_TOKEN_HERE"
@@ -70,15 +98,74 @@ class Settings(BaseSettings):
         return [int(x.strip()) for x in self.ADMIN_IDS.split(",") if x.strip().isdigit()]
 
     def get_db_path(self) -> str:
-        """Railway muhitida (/app/data) avtomatik Volume yo'lini qaytaradi."""
-        if os.path.isdir("/app/data") and self.DB_PATH == "damas_reys.db":
-            return "/app/data/damas_reys.db"
+        """Return a database path on persistent storage when running on Railway."""
+        if is_railway_runtime():
+            mount = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+            if not mount or not os.path.isdir(mount):
+                raise RuntimeError(
+                    "Railway Volume topilmadi. Xizmatga doimiy diskni ulang; "
+                    "bazasiz/vaqtinchalik joyda bot ishga tushmaydi."
+                )
+            configured = self.DB_PATH.strip()
+            if not configured:
+                raise RuntimeError("Railway muhitida DB_PATH bo'sh bo'lishi mumkin emas.")
+            if os.path.isabs(configured):
+                db_path = os.path.abspath(configured)
+            else:
+                db_path = os.path.abspath(os.path.join(mount, configured))
+            if not _path_is_within(db_path, mount):
+                raise RuntimeError(
+                    "DB_PATH Railway Volume ichida bo'lishi kerak. "
+                    "DB_PATH ni RAILWAY_VOLUME_MOUNT_PATH ichidagi faylga sozlang."
+                )
+            return db_path
         return _project_path(self.DB_PATH)
 
     def get_backup_dir(self) -> str:
         """Railway Volume doimiy zaxira papkasi."""
-        if os.path.isdir("/app/data") and self.BACKUP_DIR == "backups":
-            return "/app/data/backups"
+        if is_railway_runtime():
+            mount = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+            if not mount or not os.path.isdir(mount):
+                raise RuntimeError("Railway Volume ulanmagan; zaxira papkasini aniqlab bo'lmadi.")
+            configured = self.BACKUP_DIR.strip()
+            if not configured:
+                configured = "backups"
+            if os.path.isabs(configured):
+                backup_dir = os.path.abspath(configured)
+            else:
+                backup_dir = os.path.abspath(os.path.join(mount, configured))
+            if not _path_is_within(backup_dir, mount):
+                raise RuntimeError("BACKUP_DIR Railway Volume ichida bo'lishi kerak.")
+            return backup_dir
         return _project_path(self.BACKUP_DIR)
+
+    def validate_existing_database(self, db_path: str) -> None:
+        """Refuse to initialize a fresh, empty database on a Railway deployment."""
+        if not is_railway_runtime():
+            return
+        path = Path(db_path)
+        if not path.is_file() or path.stat().st_size == 0:
+            raise RuntimeError(
+                f"Doimiy diskda mavjud baza topilmadi: {db_path}. "
+                "Bo'sh baza yaratib foydalanuvchilar ro'yxatini yo'qotmaslik uchun bot to'xtatildi."
+            )
+        try:
+            connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                check = connection.execute("PRAGMA quick_check").fetchone()
+                tables = {
+                    row[0] for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+            finally:
+                connection.close()
+        except sqlite3.Error as exc:
+            raise RuntimeError("Railway Volume'dagi ma'lumotlar bazasini tekshirib bo'lmadi.") from exc
+        if not check or check[0] != "ok" or "students" not in tables:
+            raise RuntimeError(
+                "Railway Volume'dagi baza yaroqsiz yoki bot bazasi emas. "
+                "Ma'lumotni saqlash uchun bot ishga tushirilmadi."
+            )
 
 settings = Settings()

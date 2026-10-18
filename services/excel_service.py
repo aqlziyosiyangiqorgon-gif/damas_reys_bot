@@ -17,15 +17,37 @@ WEEKDAY_COLUMNS = {
     "chorshanba": 2,
     "payshanba": 3,
     "juma": 4,
-    "shanba": 5
+    "shanba": 5,
+    "yakshanba": 6,
 }
+
+_TIME_RANGE_RE = re.compile(
+    r"^\s*([0-9]{1,2}):([0-9]{2})\s*[-–—]\s*([0-9]{1,2}):([0-9]{2})\s*$"
+)
+_TIME_RANGE_ERROR = "Vaqt oralig'i HH:MM-HH:MM ko'rinishida bo'lishi kerak"
+
+
+def _parse_time_range(value: Any) -> Tuple[str, str]:
+    """Parse a textual time range and normalize both times to HH:MM."""
+    if not isinstance(value, str):
+        raise ValueError(_TIME_RANGE_ERROR)
+
+    match = _TIME_RANGE_RE.fullmatch(value)
+    if not match:
+        raise ValueError(_TIME_RANGE_ERROR)
+
+    start_hour, start_minute, end_hour, end_minute = match.groups()
+    return (
+        f"{start_hour.zfill(2)}:{start_minute}",
+        f"{end_hour.zfill(2)}:{end_minute}",
+    )
 
 class ExcelService:
     @staticmethod
     def generate_template(output_path: Optional[str] = None) -> str:
         """
         Bo'sh namuna .xlsx faylini generatsiya qilish.
-        Ustunlar: F.I.Sh | Mahalla | Ota telefoni | Ona telefoni | Dushanba | Seshanba | Chorshanba | Payshanba | Juma | Shanba
+        Ustunlar: F.I.Sh | Mahalla | Ota telefoni | Ona telefoni | Dushanba | Seshanba | Chorshanba | Payshanba | Juma | Shanba | Yakshanba
         """
         if not output_path:
             stamp = now_tz().strftime("%Y%m%d_%H%M%S_%f")
@@ -46,7 +68,8 @@ class ExcelService:
             "Chorshanba",
             "Payshanba",
             "Juma",
-            "Shanba"
+            "Shanba",
+            "Yakshanba",
         ]
         ws.append(headers)
 
@@ -61,6 +84,7 @@ class ExcelService:
             "09:00-11:00",
             "",
             "09:00-11:00",
+            "",
             ""
         ]
         ws.append(sample_row)
@@ -84,8 +108,21 @@ class ExcelService:
 
         # Sarlavha qatorini aniqlash (1-qator)
         header_map = {}
+        seen_weekdays = {}
+        duplicate_weekdays = set()
         for col_idx, header in enumerate(headers, 1):
-            val = _normalize_apostrophes(str(header or "")).strip().lower()
+            val = _normalize_apostrophes(str(header or "")).strip().casefold()
+
+            # Weekday labels are matched by their complete normalized name.
+            day_num = WEEKDAY_COLUMNS.get(val)
+            if day_num is not None:
+                if day_num in seen_weekdays:
+                    duplicate_weekdays.add(day_num)
+                else:
+                    seen_weekdays[day_num] = col_idx
+                    header_map[f"day_{day_num}"] = col_idx
+                continue
+
             if any(k in val for k in ["f.i.sh", "fish", "fio", "ism"]):
                 header_map["full_name"] = col_idx
             elif any(k in val for k in ["mahalla", "qishloq", "maktab"]):
@@ -100,9 +137,23 @@ class ExcelService:
             elif any(k in val for k in ["ona", "qo'shimcha"]):
                 header_map["phone_2"] = col_idx
 
-            for day_key, day_num in WEEKDAY_COLUMNS.items():
-                if day_key in val:
-                    header_map[f"day_{day_num}"] = col_idx
+        if duplicate_weekdays:
+            errors = [
+                {
+                    "row": 1,
+                    "full_name": "-",
+                    "error": f"Hafta kuni sarlavhasi takrorlangan: {day_name.capitalize()}",
+                }
+                for day_name, day_num in WEEKDAY_COLUMNS.items()
+                if day_num in duplicate_weekdays
+            ]
+            return {
+                "new_count": 0,
+                "update_count": 0,
+                "error_count": len(errors),
+                "errors": errors,
+                "valid_records": [],
+            }
 
         # Standart indekslar (agar nomlar mos kelmasa tartib bo'yicha)
         idx_name = header_map.get("full_name", 1)
@@ -118,7 +169,7 @@ class ExcelService:
             duplicate_keys = set()
             for row_idx, row_cells in enumerate(sheet_rows, start=2):
                 # Bo'sh qator bo'lsa o'tkazib yuborish
-                if not any(row_cells):
+                if not any(value is not None and str(value).strip() for value in row_cells):
                     continue
 
                 cell_value = lambda index: row_cells[index - 1] if index <= len(row_cells) else None
@@ -148,24 +199,26 @@ class ExcelService:
                 schedules = []
                 sched_error = None
                 for day_name, day_num in WEEKDAY_COLUMNS.items():
-                    col_idx = header_map.get(f"day_{day_num}", 5 + day_num)
-                    time_val = str(cell_value(col_idx) or "").strip()
-                    if time_val:
-                        if "-" not in time_val:
-                            sched_error = f"{day_name.capitalize()} dars vaqti noto'g'ri formatda: {time_val}"
-                            break
-                        parts = time_val.split("-")
-                        if len(parts) != 2:
-                            sched_error = f"{day_name.capitalize()} dars vaqti noto'g'ri formatda: {time_val}"
-                            break
-                        st = parts[0].strip()
-                        et = parts[1].strip()
-                        try:
-                            validate_schedule_times(st, et)
-                            schedules.append({"weekday": day_num, "start_time": st, "end_time": et})
-                        except ValueError:
-                            sched_error = f"{day_name.capitalize()} soati noto'g'ri: tugash vaqti boshlanishidan keyin bo'lishi va HH:MM formatida yozilishi kerak: {time_val}"
-                            break
+                    col_idx = header_map.get(f"day_{day_num}")
+                    if col_idx is None:
+                        continue
+
+                    time_val = cell_value(col_idx)
+                    if time_val is None or (isinstance(time_val, str) and not time_val.strip()):
+                        continue
+
+                    try:
+                        st, et = _parse_time_range(time_val)
+                    except ValueError:
+                        sched_error = _TIME_RANGE_ERROR
+                        break
+
+                    try:
+                        validate_schedule_times(st, et)
+                        schedules.append({"weekday": day_num, "start_time": st, "end_time": et})
+                    except ValueError:
+                        sched_error = f"{day_name.capitalize()} soati noto'g'ri: tugash vaqti boshlanishidan keyin bo'lishi va HH:MM formatida yozilishi kerak: {time_val}"
+                        break
 
                 if sched_error:
                     errors.append({"row": row_idx, "full_name": full_name_val, "error": sched_error})
@@ -245,7 +298,8 @@ class ExcelService:
             "Chorshanba",
             "Payshanba",
             "Juma",
-            "Shanba"
+            "Shanba",
+            "Yakshanba",
         ]
         ws.append(headers)
 
@@ -280,7 +334,8 @@ class ExcelService:
                     sched_map.get(2, ""),
                     sched_map.get(3, ""),
                     sched_map.get(4, ""),
-                    sched_map.get(5, "")
+                    sched_map.get(5, ""),
+                    sched_map.get(6, "")
                 ]
                 ws.append(row)
 

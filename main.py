@@ -34,9 +34,13 @@ async def log_dispatcher_error(event: ErrorEvent) -> bool:
 
 
 async def main():
-    db = Database(settings.get_db_path())
+    db_path = settings.get_db_path()
+    # Railway'da yo'qolgan Volume yoki noto'g'ri DB_PATH sababli bo'sh baza
+    # ochilib, foydalanuvchilar ro'yxati yo'qolgandek ko'rinishining oldini oladi.
+    settings.validate_existing_database(db_path)
+    db = Database(db_path)
     await db.init_db()
-    logger.info(f"Ma'lumotlar bazasi initsializatsiya qilindi: {settings.get_db_path()}")
+    logger.info(f"Ma'lumotlar bazasi initsializatsiya qilindi: {db_path}")
 
     bot = Bot(
         token=settings.BOT_TOKEN,

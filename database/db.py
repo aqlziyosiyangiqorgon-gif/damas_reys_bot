@@ -251,6 +251,46 @@ class Database:
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
+            -- Oylik to'lovlar va tarix: billing yozuvlari o'quvchi o'chirilsa ham saqlanadi.
+            CREATE TABLE IF NOT EXISTS billing_plans (
+                id INTEGER PRIMARY KEY,
+                student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE RESTRICT,
+                days_per_week INTEGER NOT NULL CHECK (days_per_week BETWEEN 1 AND 7),
+                monthly_amount INTEGER NOT NULL CHECK (monthly_amount >= 0),
+                effective_from TEXT NOT NULL,
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS invoices (
+                id INTEGER PRIMARY KEY,
+                student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE RESTRICT,
+                period TEXT NOT NULL CHECK (length(period) = 7),
+                amount INTEGER NOT NULL CHECK (amount >= 0),
+                discount INTEGER NOT NULL DEFAULT 0 CHECK (discount >= 0),
+                status TEXT NOT NULL CHECK (status IN ('unpaid', 'paid', 'waived')),
+                created_at TEXT NOT NULL,
+                UNIQUE (student_id, period)
+            );
+
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY,
+                invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE RESTRICT,
+                amount INTEGER NOT NULL CHECK (amount > 0),
+                method TEXT NOT NULL CHECK (method IN ('cash', 'card')),
+                recorded_by INTEGER NOT NULL,
+                paid_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS discount_log (
+                id INTEGER PRIMARY KEY,
+                invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE RESTRICT,
+                amount INTEGER NOT NULL CHECK (amount > 0),
+                reason TEXT NOT NULL,
+                admin_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """)
 
             # Boshlang'ich zonalar
@@ -2109,11 +2149,17 @@ class Database:
 
             new_delay_min = (trip.get("delay_min") or 0) + delay_min
 
+            # Eslatma zanjirini faqat BIRINCHI kechiktirishda qayta boshlaymiz.
+            # Keyingi kechiktirishlar hisoblagichni nolga tushirmaydi: haydovchi bir reysga
+            # cheksiz eslatma olmaydi (reys uchun jami eslatma chegaralangan).
+            reset_chain = 1 if (trip.get("delay_min") or 0) == 0 else 0
             await conn.execute("""
                 UPDATE trips
-                SET delay_min = ?, planned_time = ?, reminder_count = 0, last_reminder_at = NULL
+                SET delay_min = ?, planned_time = ?,
+                    reminder_count = CASE WHEN ? = 1 THEN 0 ELSE reminder_count END,
+                    last_reminder_at = CASE WHEN ? = 1 THEN NULL ELSE last_reminder_at END
                 WHERE id = ?
-            """, (new_delay_min, new_planned_time, trip_id))
+            """, (new_delay_min, new_planned_time, reset_chain, reset_chain, trip_id))
 
             # Reysdagi barcha o'quvchilar va ularning ota-onalarini olish
             cur_items = await conn.execute("""
@@ -2331,6 +2377,177 @@ class Database:
                 ORDER BY a.id DESC
             """, (date_str,))
             return [dict(r) for r in await cur.fetchall()]
+        finally:
+            await conn.close()
+
+    async def create_invoice_if_missing(self, student_id: int, period: str, amount: int) -> bool:
+        """Create one monthly invoice; return False when that student/month exists."""
+        if type(amount) is not int or amount < 0:
+            raise ValueError("amount must be a non-negative integer")
+        conn = await self.get_connection()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            cur = await conn.execute(
+                "INSERT OR IGNORE INTO invoices (student_id, period, amount, status, created_at) "
+                "VALUES (?, ?, ?, CASE WHEN ? = 0 THEN 'paid' ELSE 'unpaid' END, ?)",
+                (student_id, period, amount, amount, now_tz().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            await conn.commit()
+            return cur.rowcount == 1
+        except BaseException:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
+
+    async def record_payment(
+        self, invoice_id: int, amount: int, method: str, recorded_by: int, paid_at: str
+    ) -> Tuple[bool, str]:
+        """Record a partial or full payment without allowing overpayment."""
+        if type(amount) is not int or amount <= 0:
+            return False, "invalid_amount"
+        if method not in ("cash", "card"):
+            return False, "invalid_method"
+
+        conn = await self.get_connection()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            cur = await conn.execute(
+                "SELECT amount, discount, status FROM invoices WHERE id = ?", (invoice_id,)
+            )
+            invoice = await cur.fetchone()
+            if invoice is None:
+                await conn.rollback()
+                return False, "not_found"
+            if invoice["status"] == "waived":
+                await conn.rollback()
+                return False, "waived"
+
+            cur = await conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = ?", (invoice_id,)
+            )
+            paid_total = (await cur.fetchone())[0]
+            due = invoice["amount"] - invoice["discount"]
+            if paid_total + amount > due:
+                await conn.rollback()
+                return False, "overpayment"
+
+            await conn.execute(
+                "INSERT INTO payments (invoice_id, amount, method, recorded_by, paid_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (invoice_id, amount, method, recorded_by, paid_at),
+            )
+            new_total = paid_total + amount
+            status = "paid" if new_total == due else "unpaid"
+            await conn.execute("UPDATE invoices SET status = ? WHERE id = ?", (status, invoice_id))
+            await conn.commit()
+            return True, "ok"
+        except BaseException:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
+
+    async def apply_discount(
+        self, invoice_id: int, amount: int, reason: str, admin_id: int
+    ) -> Tuple[bool, str]:
+        """Apply a discount and preserve its reason in the same transaction."""
+        if type(amount) is not int or amount <= 0:
+            return False, "invalid_amount"
+        if not reason or not reason.strip():
+            return False, "invalid_reason"
+
+        conn = await self.get_connection()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            cur = await conn.execute(
+                "SELECT amount, discount, status FROM invoices WHERE id = ?", (invoice_id,)
+            )
+            invoice = await cur.fetchone()
+            if invoice is None:
+                await conn.rollback()
+                return False, "not_found"
+            if invoice["status"] == "waived":
+                await conn.rollback()
+                return False, "waived"
+            new_discount = invoice["discount"] + amount
+            if new_discount > invoice["amount"]:
+                await conn.rollback()
+                return False, "discount_exceeds_amount"
+            cur = await conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = ?", (invoice_id,)
+            )
+            paid_total = (await cur.fetchone())[0]
+            if paid_total > invoice["amount"] - new_discount:
+                await conn.rollback()
+                return False, "discount_exceeds_due"
+
+            await conn.execute("UPDATE invoices SET discount = ? WHERE id = ?", (new_discount, invoice_id))
+            await conn.execute(
+                "INSERT INTO discount_log (invoice_id, amount, reason, admin_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (invoice_id, amount, reason.strip(), admin_id, now_tz().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            if paid_total == invoice["amount"] - new_discount:
+                await conn.execute("UPDATE invoices SET status = 'paid' WHERE id = ?", (invoice_id,))
+            await conn.commit()
+            return True, "ok"
+        except BaseException:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
+
+    async def get_invoice_summary(self, student_id: int, period: str) -> Optional[Dict[str, Any]]:
+        conn = await self.get_connection()
+        try:
+            cur = await conn.execute(
+                "SELECT id, amount, discount, status FROM invoices WHERE student_id = ? AND period = ?",
+                (student_id, period),
+            )
+            invoice = await cur.fetchone()
+            if invoice is None:
+                return None
+            cur = await conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = ?", (invoice["id"],)
+            )
+            paid_total = (await cur.fetchone())[0]
+            return {
+                "id": invoice["id"],
+                "amount": invoice["amount"],
+                "discount": invoice["discount"],
+                "paid_total": paid_total,
+                "due": invoice["amount"] - invoice["discount"] - paid_total,
+                "status": invoice["status"],
+            }
+        finally:
+            await conn.close()
+
+    async def get_billing_students(self, period: str) -> List[Dict[str, Any]]:
+        """List active students with this month's invoice status and schedule count."""
+        conn = await self.get_connection()
+        try:
+            cur = await conn.execute(
+                """
+                SELECT s.id, s.full_name, COUNT(DISTINCT sch.weekday) AS days_per_week,
+                       i.id AS invoice_id, i.amount, i.discount, i.status,
+                       COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id = i.id), 0) AS paid_total
+                FROM students s
+                LEFT JOIN schedules sch ON sch.student_id = s.id
+                LEFT JOIN invoices i ON i.student_id = s.id AND i.period = ?
+                WHERE s.is_active = 1
+                GROUP BY s.id, s.full_name, i.id, i.amount, i.discount, i.status
+                ORDER BY s.full_name COLLATE NOCASE
+                """,
+                (period,),
+            )
+            rows = [dict(row) for row in await cur.fetchall()]
+            for row in rows:
+                if row["invoice_id"] is None:
+                    row.update({"paid_total": 0, "due": None})
+                else:
+                    row["due"] = row["amount"] - row["discount"] - row["paid_total"]
+            return rows
         finally:
             await conn.close()
 

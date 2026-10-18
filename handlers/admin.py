@@ -1,6 +1,7 @@
 from utils.clock import now_tz
 import os
 import time
+import logging
 from datetime import datetime
 from typing import Optional, List
 from sqlite3 import IntegrityError
@@ -16,6 +17,9 @@ from database.db import Database, normalize_phone
 from models.callbacks import (
     AdminAssignTripCallback, AdminDelayApplyCallback, AdminDelayConfirmCallback,
     AdminDelayCustomCallback, AdminDelayTripCallback, AdminSetTripDriverCallback,
+    BillingDiscountStartCallback, BillingInvoiceCallback, BillingListCallback,
+    BillingManualAmountCallback, BillingPageCallback, BillingPaymentMethodCallback,
+    BillingPaymentStartCallback, BillingPeriodCallback, BillingStudentCallback,
     ApproveTripCallback, ApproveTripsCallback, CancelTripCallback,
     BroadcastAudienceCallback, BroadcastCancelBatchCallback, BroadcastSendCallback,
     BroadcastStudentCallback, BroadcastValueCallback, PageBroadcastStudentCallback,
@@ -33,8 +37,10 @@ from utils.telegram import safe_telegram_call
 from services.scheduler_service import SchedulerService
 from services.notify_service import NotifyService
 from services.telegram_safe import safe_send, safe_send_photo
+from services.billing import tariff_for_days
 
 admin_router = Router()
+logger = logging.getLogger(__name__)
 admin_router.message.filter(F.from_user.id.in_(settings.admin_ids_list))
 admin_router.callback_query.filter(F.from_user.id.in_(settings.admin_ids_list))
 
@@ -52,6 +58,7 @@ def get_admin_menu_kb() -> ReplyKeyboardMarkup:
         KeyboardButton(text="🚐 Bugungi reyslar"),
         KeyboardButton(text="📊 Statistika / Hisobot")
     )
+    builder.row(KeyboardButton(text="💰 Oylik to'lovlar"))
     builder.row(
         KeyboardButton(text="📢 Xabar yuborish"),
         KeyboardButton(text="👥 Foydalanuvchilar")
@@ -112,6 +119,12 @@ class BroadcastStates(StatesGroup):
     waiting_for_value = State()
     waiting_for_content = State()
     confirming = State()
+
+class BillingStates(StatesGroup):
+    waiting_for_invoice_amount = State()
+    waiting_for_payment_amount = State()
+    waiting_for_discount_amount = State()
+    waiting_for_discount_reason = State()
 
 
 async def _edit_broadcast_message(message: types.Message, text: str) -> bool:
@@ -623,7 +636,7 @@ async def ask_schedule_days(target_message: types.Message, state: FSMContext, is
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📅 Dush - Chor - Juma (Toq kunlar)", callback_data="days_mwf")],
         [InlineKeyboardButton(text="📅 Sesh - Pay - Shan (Juft kunlar)", callback_data="days_tts")],
-        [InlineKeyboardButton(text="📅 Dush - Shan (Har kuni)", callback_data="days_all")],
+        [InlineKeyboardButton(text="📅 Dush - Yak (Har kuni, 7 kun)", callback_data="days_all")],
         [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin_cancel")]
     ])
     text = "5. <b>Dars kunlarini tanlang:</b>"
@@ -645,8 +658,8 @@ async def process_student_days(callback: types.CallbackQuery, state: FSMContext)
         days = [1, 3, 5]
         label = "Sesh-Pay-Shan"
     else:
-        days = [0, 1, 2, 3, 4, 5]
-        label = "Dushanba - Shanba"
+        days = [0, 1, 2, 3, 4, 5, 6]
+        label = "Dushanba - Yakshanba"
     await state.update_data(selected_days=days, days_label=label)
     await state.set_state(AddStudentStates.waiting_for_time)
     await callback.message.edit_text(
@@ -1030,7 +1043,7 @@ async def cb_show_student_schedule(callback: types.CallbackQuery, state: FSMCont
     rows = []
 
     sch_dict = {s["weekday"]: f"{s['start_time']} - {s['end_time']}" for s in schedules}
-    for idx, day_name in enumerate(WEEKDAYS_UZ[:6]):
+    for idx, day_name in enumerate(WEEKDAYS_UZ):
         time_str = sch_dict.get(idx, "Dars yo'q")
         text += f"• <b>{day_name}</b>: {escape_html(time_str)}\n"
         rows.append([InlineKeyboardButton(text=f"✏️ {day_name} ({time_str})", callback_data=EditScheduleDayCallback(student_id=student_id, weekday=idx).pack())])
@@ -1142,7 +1155,7 @@ async def cmd_admin_template(message: types.Message):
             FSInputFile(path, filename=os.path.basename(path)),
             caption=(
                 "📊 <b>O'quvchilarni ommaviy yuklash uchun Excel shablon.</b>\n\n"
-                "Ustunlar: F.I.Sh | Mahalla | Ota telefoni | Ona telefoni | Dushanba-Shanba dars vaqtlari.\n"
+                "Ustunlar: F.I.Sh | Mahalla | Ota telefoni | Ona telefoni | Dushanba-Yakshanba dars vaqtlari.\n"
                 "Format namunasi: <code>09:00-11:00</code> yoki <code>14:00-16:00</code>."
             ),
             parse_mode="HTML"
@@ -1157,11 +1170,8 @@ async def process_admin_excel_upload(message: types.Message, db: Database):
         return
     doc = message.document
     extension = os.path.splitext(doc.file_name or "")[1].lower()
-    if extension not in {".xlsx", ".xls"}:
-        await message.answer(
-            "Excel fayl .xlsx yoki .xls formatida bo'lishi kerak. "
-            "Bot shablonini to'ldirib, faylni hujjat sifatida qayta yuboring."
-        )
+    if extension != ".xlsx":
+        await message.answer("Faqat .xlsx formatidagi fayl qabul qilinadi.")
         return
     if getattr(doc, "file_size", None) is not None and doc.file_size > 10 * 1024 * 1024:
         await message.answer("Excel fayl hajmi 10 MB dan oshmasligi kerak.")
@@ -1207,6 +1217,9 @@ async def process_admin_excel_upload(message: types.Message, db: Database):
             ]
         ])
         await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    except Exception as exc:
+        logger.error("Excel upload failed (%s)", type(exc).__name__)
+        await message.answer("Faylni o'qib bo'lmadi. Shablondan foydalaning.")
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
@@ -1849,6 +1862,406 @@ async def _generate_today_plan(message: types.Message, db: Database, scheduler: 
     await message.answer(text, reply_markup=get_admin_menu_kb(), parse_mode="HTML")
 
 
+# --- Oylik to'lovlar ---
+BILLING_PAGE_SIZE = 10
+
+
+def _billing_money(value: int) -> str:
+    return f"{value:,}".replace(",", " ") + " so'm"
+
+
+def _billing_shift_period(period: str, move: str) -> str:
+    year, month = (int(part) for part in period.split("-", 1))
+    month += -1 if move == "p" else 1
+    if month == 0:
+        year -= 1
+        month = 12
+    elif month == 13:
+        year += 1
+        month = 1
+    return f"{year:04d}-{month:02d}"
+
+
+def _billing_list_keyboard(students: list, period: str, page: int) -> InlineKeyboardMarkup:
+    total_pages = max(1, (len(students) + BILLING_PAGE_SIZE - 1) // BILLING_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    rows = []
+    for student in students[page * BILLING_PAGE_SIZE:(page + 1) * BILLING_PAGE_SIZE]:
+        if student["invoice_id"] is None:
+            badge = "hisob yo'q"
+        elif student["status"] == "waived":
+            badge = "bekor qilingan"
+        elif student["due"] == 0:
+            badge = "to'langan"
+        else:
+            badge = f"qarz {_billing_money(student['due'])}"
+        rows.append([InlineKeyboardButton(
+            text=f"{student['full_name']} · {badge}",
+            callback_data=BillingStudentCallback(student_id=student["id"], period=period).pack(),
+        )])
+    period_row = [
+        InlineKeyboardButton(text="⬅️", callback_data=BillingPeriodCallback(period=period, move="p").pack()),
+        InlineKeyboardButton(text=period, callback_data="noop"),
+        InlineKeyboardButton(text="➡️", callback_data=BillingPeriodCallback(period=period, move="n").pack()),
+    ]
+    rows.append(period_row)
+    if total_pages > 1:
+        page_buttons = []
+        if page > 0:
+            page_buttons.append(InlineKeyboardButton(
+                text="⬅️ Oldingi", callback_data=BillingPageCallback(page=page - 1, period=period).pack()
+            ))
+        page_buttons.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page + 1 < total_pages:
+            page_buttons.append(InlineKeyboardButton(
+                text="Keyingi ➡️", callback_data=BillingPageCallback(page=page + 1, period=period).pack()
+            ))
+        rows.append(page_buttons)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _billing_invoice_keyboard(student_id: int, period: str, amount: int | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    if amount is not None:
+        rows.append([InlineKeyboardButton(
+            text=f"✅ {_billing_money(amount)} hisob ochish",
+            callback_data=BillingInvoiceCallback(student_id=student_id, amount=amount, period=period).pack(),
+        )])
+        rows.append([InlineKeyboardButton(
+            text="✍️ Summani qo'lda kiritish",
+            callback_data=BillingManualAmountCallback(student_id=student_id, period=period).pack(),
+        )])
+    else:
+        rows.append([InlineKeyboardButton(
+            text="✍️ Oylik summani kiritish",
+            callback_data=BillingManualAmountCallback(student_id=student_id, period=period).pack(),
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Ro'yxat", callback_data=BillingListCallback(period=period).pack())])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _billing_summary_keyboard(student_id: int, period: str, due: int) -> InlineKeyboardMarkup:
+    rows = []
+    if due > 0:
+        rows.append([InlineKeyboardButton(
+            text="💵 To'lov kiritish",
+            callback_data=BillingPaymentStartCallback(student_id=student_id, period=period).pack(),
+        )])
+        rows.append([InlineKeyboardButton(
+            text="🎁 Chegirma kiritish",
+            callback_data=BillingDiscountStartCallback(student_id=student_id, period=period).pack(),
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ Ro'yxat", callback_data=BillingListCallback(period=period).pack())])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_billing_list(message: types.Message, db: Database, period: str, page: int = 0, edit: bool = False):
+    students = await db.get_billing_students(period)
+    entered = [student for student in students if student["invoice_id"] is not None]
+    collected = sum(student["paid_total"] for student in entered)
+    remaining = sum(max(0, student["due"] or 0) for student in entered)
+    text = (
+        f"💰 <b>Oylik to'lovlar — {escape_html(period)}</b>\n\n"
+        f"👥 Faol o'quvchilar: <b>{len(students)}</b>\n"
+        f"🧾 Hisob ochilgan: <b>{len(entered)}</b>\n"
+        f"✅ Jami tushgan: <b>{_billing_money(collected)}</b>\n"
+        f"⏳ Qolgan to'lov: <b>{_billing_money(remaining)}</b>\n\n"
+        "O'quvchini tanlang. Hisobi bo'lmasa, shu oyning summasini kiriting."
+    )
+    keyboard = _billing_list_keyboard(students, period, page)
+    if edit:
+        await safe_telegram_call(message.edit_text, text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        await safe_telegram_call(message.answer, text, reply_markup=keyboard, parse_mode="HTML")
+
+
+async def _show_billing_student(message: types.Message, db: Database, student_id: int, period: str, edit: bool = True):
+    student = await db.get_student_by_id(student_id)
+    if not student or not student.get("is_active"):
+        await safe_telegram_call(message.answer, "Faol o'quvchi topilmadi.")
+        return
+    rows = await db.get_billing_students(period)
+    listed_student = next((row for row in rows if row["id"] == student_id), None)
+    if listed_student is None:
+        await safe_telegram_call(message.answer, "O'quvchi bu ro'yxatda topilmadi.")
+        return
+    summary = await db.get_invoice_summary(student_id, period)
+    name = escape_html(student["full_name"])
+    period_text = escape_html(period)
+    if summary is None:
+        days = listed_student["days_per_week"]
+        tariff = tariff_for_days(days)
+        if tariff is None:
+            text = (
+                f"👤 <b>{name}</b>\n📅 Oy: <b>{period_text}</b>\n"
+                f"🗓 Haftasiga dars kuni: <b>{days}</b>\n\n"
+                "Bu jadval uchun tayyor tarif belgilanmagan. Oylik summani qo'lda kiriting."
+            )
+            keyboard = _billing_invoice_keyboard(student_id, period)
+        else:
+            text = (
+                f"👤 <b>{name}</b>\n📅 Oy: <b>{period_text}</b>\n"
+                f"🗓 Haftasiga dars kuni: <b>{days}</b>\n\n"
+                f"Hisob hali ochilmagan. Tarif taklifi: <b>{_billing_money(tariff)}</b>. "
+                "Taklifni tasdiqlang yoki boshqa summani qo'lda kiriting."
+            )
+            keyboard = _billing_invoice_keyboard(student_id, period, tariff)
+    else:
+        status = "bekor qilingan" if summary["status"] == "waived" else (
+            "to'langan" if summary["due"] == 0 else "to'lanmagan / qisman to'langan"
+        )
+        text = (
+            f"👤 <b>{name}</b>\n📅 Oy: <b>{period_text}</b>\n\n"
+            f"💳 Oylik summa: <b>{_billing_money(summary['amount'])}</b>\n"
+            f"🎁 Chegirma: <b>{_billing_money(summary['discount'])}</b>\n"
+            f"✅ To'langan: <b>{_billing_money(summary['paid_total'])}</b>\n"
+            f"⏳ Qolgan: <b>{_billing_money(max(0, summary['due']))}</b>\n"
+            f"📌 Holati: <b>{status}</b>"
+        )
+        keyboard = _billing_summary_keyboard(student_id, period, max(0, summary["due"]))
+    if edit:
+        await safe_telegram_call(message.edit_text, text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        await safe_telegram_call(message.answer, text, reply_markup=keyboard, parse_mode="HTML")
+
+
+@admin_router.message(F.text == "💰 Oylik to'lovlar")
+async def admin_billing_menu(message: types.Message, state: FSMContext, db: Database):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await _show_billing_list(message, db, now_tz().strftime("%Y-%m"))
+
+
+@admin_router.callback_query(BillingPeriodCallback.filter())
+async def cb_billing_change_period(callback: types.CallbackQuery, db: Database, callback_data: BillingPeriodCallback):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    period = _billing_shift_period(callback_data.period, callback_data.move)
+    await _show_billing_list(callback.message, db, period, edit=True)
+    await callback.answer()
+
+
+@admin_router.callback_query(BillingPageCallback.filter())
+async def cb_billing_page(callback: types.CallbackQuery, db: Database, callback_data: BillingPageCallback):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await _show_billing_list(callback.message, db, callback_data.period, callback_data.page, edit=True)
+    await callback.answer()
+
+
+@admin_router.callback_query(BillingStudentCallback.filter())
+async def cb_billing_student(callback: types.CallbackQuery, db: Database, callback_data: BillingStudentCallback):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await _show_billing_student(callback.message, db, callback_data.student_id, callback_data.period)
+    await callback.answer()
+
+
+@admin_router.callback_query(BillingInvoiceCallback.filter())
+async def cb_billing_create_invoice(callback: types.CallbackQuery, db: Database, callback_data: BillingInvoiceCallback):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    try:
+        created = await db.create_invoice_if_missing(callback_data.student_id, callback_data.period, callback_data.amount)
+    except Exception as exc:
+        logger.error("Oylik hisobni ochishda xato: %s", type(exc).__name__)
+        await callback.answer("Hisob ochilmadi. Qayta urinib ko'ring.", show_alert=True)
+        return
+    await _show_billing_student(callback.message, db, callback_data.student_id, callback_data.period)
+    await callback.answer("Hisob ochildi." if created else "Bu oy uchun hisob avval ochilgan.")
+
+
+@admin_router.callback_query(BillingManualAmountCallback.filter())
+async def cb_billing_manual_amount(callback: types.CallbackQuery, state: FSMContext, callback_data: BillingManualAmountCallback):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(student_id=callback_data.student_id, period=callback_data.period)
+    await state.set_state(BillingStates.waiting_for_invoice_amount)
+    await safe_telegram_call(
+        callback.message.edit_text,
+        "Oylik summani faqat butun so'mda kiriting. Masalan: <code>60000</code>",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@admin_router.message(BillingStates.waiting_for_invoice_amount, F.text)
+async def process_billing_invoice_amount(message: types.Message, state: FSMContext, db: Database):
+    if not is_admin(message.from_user.id):
+        return
+    raw = message.text.strip()
+    if not raw.isdigit():
+        await message.answer("Summani musbat yoki nol butun son ko'rinishida kiriting. Masalan: 60000")
+        return
+    data = await state.get_data()
+    try:
+        created = await db.create_invoice_if_missing(data["student_id"], data["period"], int(raw))
+    except Exception as exc:
+        logger.error("Qo'lda oylik hisob ochishda xato: %s", type(exc).__name__)
+        await state.clear()
+        await message.answer("Hisob ochilmadi. O'quvchi va oy ma'lumotlarini tekshiring.")
+        return
+    await state.clear()
+    if not created:
+        await message.answer("Bu o'quvchi uchun shu oyga hisob avval ochilgan.")
+    await _show_billing_student(message, db, data["student_id"], data["period"], edit=False)
+
+
+@admin_router.callback_query(BillingPaymentStartCallback.filter())
+async def cb_billing_payment_start(callback: types.CallbackQuery, state: FSMContext, db: Database, callback_data: BillingPaymentStartCallback):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    summary = await db.get_invoice_summary(callback_data.student_id, callback_data.period)
+    if not summary or summary["status"] == "waived" or summary["due"] <= 0:
+        await callback.answer("To'lov kiritish uchun qarz mavjud emas.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(student_id=callback_data.student_id, period=callback_data.period)
+    await state.set_state(BillingStates.waiting_for_payment_amount)
+    await safe_telegram_call(
+        callback.message.edit_text,
+        f"To'lov summasini kiriting. Qolgan qarz: <b>{_billing_money(summary['due'])}</b>.",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@admin_router.message(BillingStates.waiting_for_payment_amount, F.text)
+async def process_billing_payment_amount(message: types.Message, state: FSMContext, db: Database):
+    if not is_admin(message.from_user.id):
+        return
+    raw = message.text.strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        await message.answer("To'lov summasini 0 dan katta butun so'mda kiriting.")
+        return
+    data = await state.get_data()
+    summary = await db.get_invoice_summary(data["student_id"], data["period"])
+    amount = int(raw)
+    if not summary or amount > summary["due"]:
+        await message.answer("Bu summa qolgan qarzdan katta. To'g'ri summani qayta kiriting.")
+        return
+    await state.update_data(payment_amount=amount)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="💵 Naqd", callback_data=BillingPaymentMethodCallback(
+                student_id=data["student_id"], period=data["period"], method="cash"
+            ).pack()
+        ),
+        InlineKeyboardButton(
+            text="💳 Karta", callback_data=BillingPaymentMethodCallback(
+                student_id=data["student_id"], period=data["period"], method="card"
+            ).pack()
+        ),
+    ]])
+    await message.answer(f"{_billing_money(amount)} to'lov qaysi usulda olindi?", reply_markup=keyboard)
+
+
+@admin_router.callback_query(BillingPaymentMethodCallback.filter())
+async def cb_billing_payment_method(callback: types.CallbackQuery, state: FSMContext, db: Database, callback_data: BillingPaymentMethodCallback):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    data = await state.get_data()
+    if (data.get("student_id") != callback_data.student_id or data.get("period") != callback_data.period
+            or type(data.get("payment_amount")) is not int):
+        await callback.answer("To'lov kiritish muddati tugagan. Qaytadan boshlang.", show_alert=True)
+        return
+    summary = await db.get_invoice_summary(callback_data.student_id, callback_data.period)
+    if not summary:
+        await state.clear()
+        await callback.answer("Hisob topilmadi.", show_alert=True)
+        return
+    ok, reason = await db.record_payment(
+        summary["id"], data["payment_amount"], callback_data.method,
+        callback.from_user.id, now_tz().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    await state.clear()
+    if not ok:
+        message_by_reason = {
+            "overpayment": "To'lov qolgan qarzdan oshib ketdi.",
+            "waived": "Bu hisob bekor qilingan.",
+            "not_found": "Hisob topilmadi.",
+        }
+        await callback.answer(message_by_reason.get(reason, "To'lov saqlanmadi."), show_alert=True)
+        return
+    await _show_billing_student(callback.message, db, callback_data.student_id, callback_data.period)
+    await callback.answer("To'lov saqlandi.")
+
+
+@admin_router.callback_query(BillingDiscountStartCallback.filter())
+async def cb_billing_discount_start(callback: types.CallbackQuery, state: FSMContext, db: Database, callback_data: BillingDiscountStartCallback):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    summary = await db.get_invoice_summary(callback_data.student_id, callback_data.period)
+    if not summary or summary["status"] == "waived" or summary["due"] <= 0:
+        await callback.answer("Chegirma kiritish uchun qarz mavjud emas.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(student_id=callback_data.student_id, period=callback_data.period)
+    await state.set_state(BillingStates.waiting_for_discount_amount)
+    await safe_telegram_call(callback.message.edit_text, "Chegirma summasini butun so'mda kiriting:")
+    await callback.answer()
+
+
+@admin_router.message(BillingStates.waiting_for_discount_amount, F.text)
+async def process_billing_discount_amount(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    raw = message.text.strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        await message.answer("Chegirma summasini 0 dan katta butun son qilib kiriting.")
+        return
+    await state.update_data(discount_amount=int(raw))
+    await state.set_state(BillingStates.waiting_for_discount_reason)
+    await message.answer("Chegirma sababini yozing:")
+
+
+@admin_router.message(BillingStates.waiting_for_discount_reason, F.text)
+async def process_billing_discount_reason(message: types.Message, state: FSMContext, db: Database):
+    if not is_admin(message.from_user.id):
+        return
+    reason = message.text.strip()
+    if not reason:
+        await message.answer("Chegirma sababini bo'sh qoldirmang.")
+        return
+    data = await state.get_data()
+    summary = await db.get_invoice_summary(data["student_id"], data["period"])
+    if not summary:
+        await state.clear()
+        await message.answer("Hisob topilmadi.")
+        return
+    ok, why = await db.apply_discount(summary["id"], data["discount_amount"], reason, message.from_user.id)
+    await state.clear()
+    if not ok:
+        errors = {
+            "discount_exceeds_amount": "Chegirma oylik summadan katta bo'lishi mumkin emas.",
+            "discount_exceeds_due": "Chegirma to'langan summani hisobga olganda qolgan qarzdan katta.",
+            "waived": "Bu hisob bekor qilingan.",
+        }
+        await message.answer(errors.get(why, "Chegirma saqlanmadi."))
+        return
+    await message.answer(f"✅ Chegirma saqlandi: {_billing_money(data['discount_amount'])}.")
+    await _show_billing_student(message, db, data["student_id"], data["period"], edit=False)
+
+
+@admin_router.callback_query(BillingListCallback.filter())
+async def cb_billing_list(callback: types.CallbackQuery, db: Database, callback_data: BillingListCallback):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+    await _show_billing_list(callback.message, db, callback_data.period, edit=True)
+    await callback.answer()
+
+
 @admin_router.message(F.photo | F.sticker)
 async def reject_non_text_fsm_input(message: types.Message, state: FSMContext):
     """Reject unsupported media while an admin workflow expects text."""
@@ -1945,7 +2358,7 @@ async def cb_admin_excel_template(callback: types.CallbackQuery):
             FSInputFile(path, filename=os.path.basename(path)),
             caption=(
                 "📄 <b>O'quvchilarni ommaviy yuklash uchun Excel shablon.</b>\n\n"
-                "Ustunlar: F.I.Sh | Mahalla | Ota telefoni | Ona telefoni | Dushanba-Shanba dars vaqtlari."
+                "Ustunlar: F.I.Sh | Mahalla | Ota telefoni | Ona telefoni | Dushanba-Yakshanba dars vaqtlari."
             ),
             parse_mode="HTML"
         )
@@ -1972,7 +2385,7 @@ async def cb_admin_excel_upload_info(callback: types.CallbackQuery):
         "📥 <b>Yangi Excel yuklash bo'yicha yo'riqnoma:</b>\n\n"
         "1. Avval [📄 Bo'sh shablon olish] tugmasi orqali shablonni yuklab oling.\n"
         "2. Shablon ustunlarini to'ldiring (vaqtlarni <code>09:00-11:00</code> formatida kiriting).\n"
-        "3. Tayyor bo'lgan <b>.xlsx yoki .xls</b> faylni to'g'ridan-to'g'ri ushbu bot chatiga fayl (document) sifatida tashlang.\n\n"
+        "3. Tayyor bo'lgan <b>.xlsx</b> faylni to'g'ridan-to'g'ri ushbu bot chatiga fayl (document) sifatida tashlang.\n\n"
         "<i>Bot avtomatik tarzda ma'lumotlarni tekshirib, saqlashdan oldin sizga hisobot taqdim etadi.</i>"
     )
     await callback.message.edit_text(text, parse_mode="HTML")
