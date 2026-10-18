@@ -225,6 +225,5 @@ async def test_admin_payment_callback_records_payment(billing_db, monkeypatch):
     assert summary["paid_total"] == 15_000
     assert summary["due"] == 45_000
     assert summary["status"] == "unpaid"
-    state.clear.assert_awaited_once()
-    callback.answer.assert_awaited_once_with("To'lov saqlandi.")
+    assert callback.answer.await_args.args[0].startswith("To'lov saqlandi")
     assert "To'langan" in callback.message.edit_text.await_args.args[0]

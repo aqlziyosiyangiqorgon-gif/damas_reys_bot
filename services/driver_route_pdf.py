@@ -88,7 +88,7 @@ def _clock(minutes: int | None) -> str:
     return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
-def _pickup_times(trip: dict[str, Any]) -> dict[int, str]:
+def estimate_pickup_times(trip: dict[str, Any]) -> dict[int, str]:
     """Estimate each morning pickup from route order and village-to-center times."""
     current = _minutes(trip.get("planned_time"))
     if current is None:
@@ -196,11 +196,11 @@ def build_driver_daily_pdf(trips: list[dict[str, Any]], driver_name: str, date_s
             ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ]))
-        pickup_times = _pickup_times(trip) if center_trip else {}
+        pickup_times = estimate_pickup_times(trip) if center_trip else {}
         items = list(trip.get("items", []))
         if center_trip:
             items.sort(key=lambda item: (pickup_times.get(int(item.get("id", 0)), "99:99"), item.get("route_order", 0), item.get("full_name", "")))
-            time_header = "Olish vaqti"
+            time_header = "Olish / dars vaqti"
         else:
             items.sort(key=lambda item: (item.get("lesson_end_time") or "99:99", item.get("route_order", 0), item.get("full_name", "")))
             time_header = "Dars tugashi"
@@ -211,7 +211,12 @@ def build_driver_daily_pdf(trips: list[dict[str, Any]], driver_name: str, date_s
             Paragraph("Holat", header_style),
         ]]
         for index, item in enumerate(items, start=1):
-            item_time = pickup_times.get(int(item.get("id", 0)), "--:--") if center_trip else (item.get("lesson_end_time") or trip.get("planned_time") or "--:--")
+            if center_trip:
+                pickup_time = pickup_times.get(int(item.get("id", 0)), "--:--")
+                lesson_start = item.get("lesson_start_time")
+                item_time = f"{pickup_time} / {lesson_start}" if lesson_start else pickup_time
+            else:
+                item_time = item.get("lesson_end_time") or trip.get("planned_time") or "--:--"
             pickup = " / ".join(part for part in (_latin_text(item.get("village_name", "")), _latin_text(item.get("pickup_point", ""))) if part)
             rows.append([
                 Paragraph(str(index), cell_style),
@@ -220,7 +225,7 @@ def build_driver_daily_pdf(trips: list[dict[str, Any]], driver_name: str, date_s
                 Paragraph(_safe(pickup), cell_style),
                 Paragraph(_safe(_status(str(item.get("status", "")))), cell_style),
             ])
-        table = Table(rows, colWidths=[0.65 * cm, 2.2 * cm, 4.55 * cm, 6.0 * cm, 3.5 * cm], repeatRows=1, hAlign="LEFT")
+        table = Table(rows, colWidths=[0.65 * cm, 3.0 * cm, 4.0 * cm, 5.7 * cm, 3.3 * cm], repeatRows=1, hAlign="LEFT")
         table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), NAVY), ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, PALE]),
             ("LINEBELOW", (0, 0), (-1, 0), 1.2, GOLD), ("LINEBELOW", (0, 1), (-1, -1), 0.35, colors.HexColor("#DFE7EC")),

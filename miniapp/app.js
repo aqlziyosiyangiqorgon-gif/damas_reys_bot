@@ -11,6 +11,7 @@
   };
   const dayNames = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"];
   let currentData = null;
+  let selectedParentChildId = null;
   let adminSection = "home";
   let adminPeriod = "";
   let excelPreview = null;
@@ -63,7 +64,7 @@
     const total = node("div", null, `billing-total${billing.total_due > 0 ? " has-debt" : ""}`);
     total.append(node("span", "Jami qolgan qarz"), node("strong", formatMoney(billing.total_due)));
     section.append(total);
-    section.append(node("p", "Quyida har bir farzandingizning qarzi, jadvali va kelmaslik xabari alohida ko‘rsatiladi.", "muted billing-hint"));
+    section.append(node("p", "Farzandingizni tanlab, uning shaxsiy kabinetini oching.", "muted billing-hint"));
     content.append(section);
   }
 
@@ -144,79 +145,120 @@
   }
 
   function renderParent(data) {
-    renderParentBillingSummary(data.billing);
-    content.append(node("h2", `Farzandlarim${data.children.length ? ` · ${data.children.length}` : ""}`, "section-title"));
     if (!data.children.length) {
+      renderParentBillingSummary(data.billing);
+      content.append(node("h2", "Farzandlarim", "section-title"));
       content.append(empty("Sizga tasdiqlangan o‘quvchi biriktirilmagan."));
       return;
     }
     const billingByStudent = new Map((data.billing?.children || []).map(item => [Number(item.student_id), item]));
-    for (const [index, child] of data.children.entries()) {
-      const childBilling = billingByStudent.get(Number(child.id));
-      const due = Number(childBilling?.total_due || 0);
-      const section = node("details", null, "parent-child-card");
-      section.open = index === 0;
-      const heading = node("summary", null, "parent-child-summary");
-      const nameBlock = node("span", null, "parent-child-name");
-      nameBlock.append(node("strong", child.name), node("small", child.village || "Mahalla ko‘rsatilmagan"));
-      const hasInvoice = Boolean(childBilling?.current_invoice || (childBilling?.overdue_invoices || []).length);
-      const debtText = due > 0 ? formatMoney(due) : hasInvoice ? "Qarz yo‘q" : "Hisob kutilmoqda";
-      const debtBadge = node("span", debtText, `parent-child-debt${due > 0 ? " due" : ""}`);
-      heading.append(nameBlock, debtBadge);
-      section.append(heading);
-      const body = node("div", null, "parent-child-body");
-      body.append(node("div", `📍 ${child.today_status}`, "status-line"));
-      renderChildBilling(body, childBilling, data.billing);
-
-      const scheduleBlock = node("section", null, "parent-detail-block");
-      scheduleBlock.append(node("h3", "📅 Dars jadvali"));
-      const schedules = [...child.schedules].sort((a, b) => a.weekday - b.weekday);
-      if (schedules.length) {
-        const list = node("div", null, "schedule-list");
-        for (const schedule of schedules) {
-          const row = node("div", null, "schedule-row");
-          row.append(node("span", schedule.day || dayNames[schedule.weekday] || "Kun"));
-          row.append(node("strong", `${schedule.start}–${schedule.end}`));
-          list.append(row);
-        }
-        scheduleBlock.append(list);
-      } else {
-        scheduleBlock.append(node("p", "Dars jadvali kiritilmagan.", "muted"));
-      }
-      body.append(scheduleBlock);
-
-      const absenceBlock = node("section", null, "parent-detail-block absence-block");
-      absenceBlock.append(node("h3", "🚫 Bugun kelmaslik xabari"));
-      if (child.today_status_code === "absent") {
-        absenceBlock.append(node("p", "Bugungi kelmaslik xabaringiz yuborilgan.", "absence-confirmation"));
-      } else {
-        const label = node("label", "Sababi (ixtiyoriy)", "input-label");
-        const reason = node("textarea", null, "reason-input");
-        reason.maxLength = 100;
-        reason.placeholder = "Masalan: shamollab qoldi";
-        const report = node("button", "🚫 Bugun kelmaydi", "action-button secondary");
-        report.type = "button";
-        report.addEventListener("click", async () => {
-          const confirmed = tg?.showConfirm ? await new Promise(resolve => tg.showConfirm("Farzandingiz bugun kelmasligini bildirasizmi?", resolve)) : window.confirm("Farzandingiz bugun kelmasligini bildirasizmi?");
-          if (!confirmed) return;
-          report.disabled = true;
-          try {
-            const result = await api("/api/miniapp/action", {
-              method: "POST", body: JSON.stringify({ action: "report_absence", student_id: child.id, reason: reason.value })
-            });
-            showNotice(result.message);
-            await loadDashboard();
-          } catch (error) {
-            showNotice(error.message);
-            report.disabled = false;
-          }
+    const selectedChild = data.children.find(child => Number(child.id) === Number(selectedParentChildId));
+    if (!selectedChild) {
+      selectedParentChildId = null;
+      renderParentBillingSummary(data.billing);
+      content.append(node("h2", `Farzandlarim · ${data.children.length}`, "section-title"));
+      for (const child of data.children) {
+        const childBilling = billingByStudent.get(Number(child.id));
+        const due = Number(childBilling?.total_due || 0);
+        const hasInvoice = Boolean(childBilling?.current_invoice || (childBilling?.overdue_invoices || []).length);
+        const debtText = due > 0 ? `Qarz · ${formatMoney(due)}` : hasInvoice ? "Qarz yo‘q" : "Hisob kutilmoqda";
+        const section = node("article", null, "parent-child-card parent-child-choice");
+        const heading = node("div", null, "parent-child-summary");
+        const nameBlock = node("span", null, "parent-child-name");
+        nameBlock.append(node("strong", child.name), node("small", child.village || "Mahalla ko‘rsatilmagan"));
+        heading.append(nameBlock, node("span", debtText, `parent-child-debt${due > 0 ? " due" : ""}`));
+        section.append(heading, node("div", `📍 Bugungi holat: ${child.today_status}`, "status-line"));
+        const open = node("button", "Farzand kabinetini ochish  →", "action-button");
+        open.type = "button";
+        open.addEventListener("click", () => {
+          selectedParentChildId = Number(child.id);
+          content.replaceChildren();
+          renderParent(data);
         });
-        absenceBlock.append(label, reason, report);
+        section.append(open);
+        content.append(section);
       }
-      body.append(absenceBlock);
-      section.append(body);
-      content.append(section);
+      return;
     }
+
+    const child = selectedChild;
+    const childBilling = billingByStudent.get(Number(child.id));
+    const switcher = node("div", null, "parent-child-switcher");
+    const back = node("button", "← Barcha farzandlar", "action-button secondary");
+    back.type = "button";
+    back.addEventListener("click", () => {
+      selectedParentChildId = null;
+      content.replaceChildren();
+      renderParent(data);
+    });
+    switcher.append(back);
+    content.append(switcher);
+
+    const choices = node("div", null, "parent-child-tabs");
+    for (const candidate of data.children) {
+      const tab = node("button", candidate.name, `parent-child-tab${Number(candidate.id) === Number(child.id) ? " active" : ""}`);
+      tab.type = "button";
+      tab.setAttribute("aria-pressed", String(Number(candidate.id) === Number(child.id)));
+      tab.addEventListener("click", () => {
+        selectedParentChildId = Number(candidate.id);
+        content.replaceChildren();
+        renderParent(data);
+      });
+      choices.append(tab);
+    }
+    content.append(choices);
+
+    const section = card(`👤 ${child.name}`, child.village || "Mahalla ko‘rsatilmagan", "Farzand kabineti");
+    section.append(node("div", `📍 Bugungi holat: ${child.today_status}`, "status-line"));
+    renderChildBilling(section, childBilling, data.billing);
+
+    const scheduleBlock = node("section", null, "parent-detail-block");
+    scheduleBlock.append(node("h3", "📅 Dars jadvali"));
+    const schedules = [...child.schedules].sort((a, b) => a.weekday - b.weekday);
+    if (schedules.length) {
+      const list = node("div", null, "schedule-list");
+      for (const schedule of schedules) {
+        const row = node("div", null, "schedule-row");
+        row.append(node("span", schedule.day || dayNames[schedule.weekday] || "Kun"));
+        row.append(node("strong", `${schedule.start}–${schedule.end}`));
+        list.append(row);
+      }
+      scheduleBlock.append(list);
+    } else {
+      scheduleBlock.append(node("p", "Dars jadvali kiritilmagan.", "muted"));
+    }
+    section.append(scheduleBlock);
+
+    const absenceBlock = node("section", null, "parent-detail-block absence-block");
+    absenceBlock.append(node("h3", "🚫 Bugun kelmaslik xabari"));
+    if (child.today_status_code === "absent") {
+      absenceBlock.append(node("p", "Bugungi kelmaslik xabaringiz yuborilgan.", "absence-confirmation"));
+    } else {
+      const label = node("label", "Sababi (ixtiyoriy)", "input-label");
+      const reason = node("textarea", null, "reason-input");
+      reason.maxLength = 100;
+      reason.placeholder = "Masalan: shamollab qoldi";
+      const report = node("button", "🚫 Bugun kelmaydi", "action-button secondary");
+      report.type = "button";
+      report.addEventListener("click", async () => {
+        const confirmed = tg?.showConfirm ? await new Promise(resolve => tg.showConfirm("Farzandingiz bugun kelmasligini bildirasizmi?", resolve)) : window.confirm("Farzandingiz bugun kelmasligini bildirasizmi?");
+        if (!confirmed) return;
+        report.disabled = true;
+        try {
+          const result = await api("/api/miniapp/action", {
+            method: "POST", body: JSON.stringify({ action: "report_absence", student_id: child.id, reason: reason.value })
+          });
+          showNotice(result.message);
+          await loadDashboard();
+        } catch (error) {
+          showNotice(error.message);
+          report.disabled = false;
+        }
+      });
+      absenceBlock.append(label, reason, report);
+    }
+    section.append(absenceBlock);
+    content.append(section);
   }
 
   function tripCard(trip, mode) {

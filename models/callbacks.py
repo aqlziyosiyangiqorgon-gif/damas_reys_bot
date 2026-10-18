@@ -22,6 +22,11 @@ class AbsentButtonCallback(CallbackData, prefix="absent_btn"):
     student_id: int
 
 
+class ParentChildCallback(CallbackData, prefix="parent_child"):
+    action: Literal["list", "open", "track", "schedule", "billing", "absence"]
+    student_id: int
+
+
 class DriverAlertCallback(CallbackData, prefix="driver_alert"):
     action: str
 

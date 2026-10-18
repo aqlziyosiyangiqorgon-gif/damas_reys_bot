@@ -185,6 +185,7 @@ class Database:
                 approved INTEGER NOT NULL DEFAULT 0,
                 reminder_count INTEGER NOT NULL DEFAULT 0,
                 last_reminder_at TEXT,
+                driver_advance_reminded_at TEXT,
                 delay_min INTEGER NOT NULL DEFAULT 0,
                 started_at TEXT,
                 finished_at TEXT
@@ -354,6 +355,13 @@ class Database:
             if "billing_mode" not in invoice_columns:
                 await conn.execute(
                     "ALTER TABLE invoices ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'manual'"
+                )
+
+            cur_col = await conn.execute("PRAGMA table_info(trips)")
+            trip_columns = [row[1] for row in await cur_col.fetchall()]
+            if "driver_advance_reminded_at" not in trip_columns:
+                await conn.execute(
+                    "ALTER TABLE trips ADD COLUMN driver_advance_reminded_at TEXT"
                 )
 
             await conn.commit()
@@ -2036,6 +2044,76 @@ class Database:
         finally:
             await conn.close()
 
+    async def get_driver_advance_reminder_trips(self, now_dt: datetime) -> List[Dict[str, Any]]:
+        """Return approved morning trips whose earliest lesson starts in <=50 minutes."""
+        date_str = now_dt.strftime("%Y-%m-%d")
+        weekday = datetime.strptime(date_str, "%Y-%m-%d").weekday()
+        conn = await self.get_connection()
+        try:
+            cur = await conn.execute(
+                """
+                SELECT t.*, d.full_name AS driver_name, d.telegram_id AS driver_tg_id
+                FROM trips t
+                JOIN drivers d ON d.id = t.driver_id AND d.is_active = 1
+                WHERE t.date = ? AND t.direction = 'to_center' AND t.status = 'approved'
+                  AND t.driver_advance_reminded_at IS NULL
+                ORDER BY t.planned_time ASC, t.id ASC
+                """,
+                (date_str,),
+            )
+            trips = [dict(row) for row in await cur.fetchall()]
+            due: List[Dict[str, Any]] = []
+            for trip in trips:
+                cur_items = await conn.execute(
+                    """
+                    SELECT ti.*, s.full_name, sch.start_time AS lesson_start_time,
+                           sch.end_time AS lesson_end_time, v.name AS village_name,
+                           v.travel_minutes, v.route_order, v.pickup_point
+                    FROM trip_items ti
+                    JOIN students s ON s.id = ti.student_id
+                    JOIN villages v ON v.id = ti.village_id
+                    JOIN schedules sch ON sch.student_id = s.id AND sch.weekday = ?
+                    WHERE ti.trip_id = ? AND ti.status != 'absent'
+                    ORDER BY v.route_order ASC, ti.id ASC
+                    """,
+                    (weekday, trip["id"]),
+                )
+                items = [dict(row) for row in await cur_items.fetchall()]
+                starts = [item["lesson_start_time"] for item in items if item.get("lesson_start_time")]
+                if not starts:
+                    continue
+                earliest_start = min(starts)
+                try:
+                    lesson_dt = datetime.strptime(f"{date_str} {earliest_start}", "%Y-%m-%d %H:%M")
+                except ValueError:
+                    continue
+                reminder_dt = lesson_dt - timedelta(minutes=50)
+                # If the scheduler was briefly unavailable, send the reminder late
+                # while the lesson is still ahead; never send an advance alert after class.
+                if reminder_dt <= now_dt < lesson_dt:
+                    trip["items"] = items
+                    trip["first_lesson_time"] = earliest_start
+                    due.append(trip)
+            return due
+        finally:
+            await conn.close()
+
+    async def mark_driver_advance_reminder_sent(self, trip_id: int, sent_at: str) -> bool:
+        """Mark a route reminder after Telegram confirms the PDF was delivered."""
+        conn = await self.get_connection()
+        try:
+            cur = await conn.execute(
+                """
+                UPDATE trips SET driver_advance_reminded_at = ?
+                WHERE id = ? AND driver_advance_reminded_at IS NULL
+                """,
+                (sent_at, trip_id),
+            )
+            await conn.commit()
+            return cur.rowcount == 1
+        finally:
+            await conn.close()
+
     # --- 8-faza: Kelmaydi (Absence) va Excel import metodlari ---
     async def match_village_by_name_or_school(self, village_query: str) -> Optional[int]:
         """
@@ -2820,11 +2898,19 @@ class Database:
     async def record_payment(
         self, invoice_id: int, amount: int, method: str, recorded_by: int, paid_at: str
     ) -> Tuple[bool, str]:
-        """Record a partial or full payment without allowing overpayment."""
+        ok, reason, _payment_id = await self.record_payment_with_id(
+            invoice_id, amount, method, recorded_by, paid_at
+        )
+        return ok, reason
+
+    async def record_payment_with_id(
+        self, invoice_id: int, amount: int, method: str, recorded_by: int, paid_at: str
+    ) -> Tuple[bool, str, Optional[int]]:
+        """Record a payment without allowing overpayment and return its receipt ID."""
         if type(amount) is not int or amount <= 0:
-            return False, "invalid_amount"
+            return False, "invalid_amount", None
         if method not in ("cash", "card"):
-            return False, "invalid_method"
+            return False, "invalid_method", None
 
         conn = await self.get_connection()
         try:
@@ -2835,10 +2921,10 @@ class Database:
             invoice = await cur.fetchone()
             if invoice is None:
                 await conn.rollback()
-                return False, "not_found"
+                return False, "not_found", None
             if invoice["status"] == "waived":
                 await conn.rollback()
-                return False, "waived"
+                return False, "waived", None
 
             cur = await conn.execute(
                 "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = ?", (invoice_id,)
@@ -2847,9 +2933,9 @@ class Database:
             due = invoice["amount"] - invoice["discount"]
             if paid_total + amount > due:
                 await conn.rollback()
-                return False, "overpayment"
+                return False, "overpayment", None
 
-            await conn.execute(
+            cur = await conn.execute(
                 "INSERT INTO payments (invoice_id, amount, method, recorded_by, paid_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (invoice_id, amount, method, recorded_by, paid_at),
@@ -2858,10 +2944,43 @@ class Database:
             status = "paid" if new_total == due else "unpaid"
             await conn.execute("UPDATE invoices SET status = ? WHERE id = ?", (status, invoice_id))
             await conn.commit()
-            return True, "ok"
+            return True, "ok", int(cur.lastrowid)
         except BaseException:
             await conn.rollback()
             raise
+        finally:
+            await conn.close()
+
+    async def get_payment_receipt_details(self, payment_id: int) -> Optional[Dict[str, Any]]:
+        """Get a payment and the invoice/student snapshot needed for its receipt."""
+        conn = await self.get_connection()
+        try:
+            cur = await conn.execute(
+                """
+                SELECT p.id AS payment_id, p.amount AS payment_amount, p.method, p.paid_at,
+                       p.recorded_by, i.id AS invoice_id, i.period, i.amount AS invoice_amount,
+                       i.discount, i.billing_mode, s.id AS student_id, s.full_name AS student_name,
+                       v.name AS village_name,
+                       COALESCE((SELECT COUNT(*) FROM invoice_lesson_days ild WHERE ild.invoice_id = i.id), 0) AS lesson_count,
+                       COALESCE((SELECT SUM(prior.amount) FROM payments prior
+                                 WHERE prior.invoice_id = p.invoice_id AND prior.id <= p.id), 0) AS paid_total
+                FROM payments p
+                JOIN invoices i ON i.id = p.invoice_id
+                JOIN students s ON s.id = i.student_id
+                LEFT JOIN villages v ON v.id = s.village_id
+                WHERE p.id = ?
+                """,
+                (payment_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["remaining_due"] = max(
+                0, result["invoice_amount"] - result["discount"] - result["paid_total"]
+            )
+            result["paid_before"] = result["paid_total"] - result["payment_amount"]
+            return result
         finally:
             await conn.close()
 

@@ -36,6 +36,7 @@ from utils.time_validation import validate_schedule_times
 from utils.telegram import safe_telegram_call
 from services.scheduler_service import SchedulerService
 from services.notify_service import NotifyService
+from services.payment_receipt import send_payment_receipt
 from services.telegram_safe import safe_send, safe_send_photo
 
 admin_router = Router()
@@ -2177,7 +2178,7 @@ async def cb_billing_payment_method(callback: types.CallbackQuery, state: FSMCon
         await state.clear()
         await callback.answer("Hisob topilmadi.", show_alert=True)
         return
-    ok, reason = await db.record_payment(
+    ok, reason, payment_id = await db.record_payment_with_id(
         summary["id"], data["payment_amount"], callback_data.method,
         callback.from_user.id, now_tz().strftime("%Y-%m-%d %H:%M:%S"),
     )
@@ -2190,8 +2191,19 @@ async def cb_billing_payment_method(callback: types.CallbackQuery, state: FSMCon
         }
         await callback.answer(message_by_reason.get(reason, "To'lov saqlanmadi."), show_alert=True)
         return
+    await callback.answer("To'lov saqlandi; chek yuborilmoqda.")
     await _show_billing_student(callback.message, db, callback_data.student_id, callback_data.period)
-    await callback.answer("To'lov saqlandi.")
+    bot = getattr(callback, "bot", None) or getattr(getattr(callback, "message", None), "bot", None)
+    delivery = await send_payment_receipt(db, bot, payment_id) if payment_id is not None and bot is not None else "failed"
+    if delivery != "sent":
+        delivery_messages = {
+            "partial": "⚠️ To'lov saqlandi. Chek ayrim ota-onalarga yuborilmadi.",
+            "no_parent": "⚠️ To'lov saqlandi, lekin ota-onaning Telegram akkaunti ulanmagan.",
+            "unavailable": "⚠️ To'lov saqlandi, lekin chek yuborish xizmati mavjud emas.",
+            "failed": "⚠️ To'lov saqlandi, ammo chekni yuborib bo'lmadi.",
+        }
+        if bot is not None:
+            await safe_send(bot, callback.from_user.id, delivery_messages.get(delivery, "⚠️ Chek yuborilmadi."))
 
 
 @admin_router.callback_query(BillingDiscountStartCallback.filter())

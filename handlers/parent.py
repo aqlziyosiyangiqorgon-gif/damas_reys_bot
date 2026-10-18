@@ -7,6 +7,7 @@ from models.callbacks import (
     AbsentButtonCallback,
     AbsentSelectCallback,
     ConfirmChildCallback,
+    ParentChildCallback,
     RejectChildCallback,
 )
 from aiogram.fsm.state import State, StatesGroup
@@ -43,6 +44,25 @@ async def _notify_center_admin_absence(bot, info: dict, reason: str = "") -> Non
     await safe_send(bot, settings.CENTER_ADMIN_TG_ID, text, parse_mode="HTML")
 
 WEEKDAYS_UZ = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"]
+MONTHS_UZ = ("Yanvar", "Fevral", "Mart", "Aprel", "May", "Iyun", "Iyul", "Avgust", "Sentabr", "Oktabr", "Noyabr", "Dekabr")
+
+
+def _billing_period_label(period: str) -> str:
+    try:
+        year, month = period.split("-")
+        return f"{MONTHS_UZ[int(month) - 1]} {year}"
+    except (ValueError, IndexError, AttributeError):
+        return str(period)
+
+
+def _billing_status(invoice: dict) -> str:
+    if invoice.get("status") == "waived":
+        return "Hisob bekor qilingan"
+    if int(invoice.get("due", 0)) == 0:
+        return "To‘langan" if int(invoice.get("amount", 0)) > 0 else "Qarz yo‘q"
+    if int(invoice.get("paid_total", 0)) > 0:
+        return "Qisman to‘langan"
+    return "To‘lanmagan"
 
 class ParentStates(StatesGroup):
     waiting_for_absence_reason = State()
@@ -72,8 +92,9 @@ def get_parent_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📍 Farzandim qayerda?"), KeyboardButton(text="🚫 Bugun kelmaydi")],
-            [KeyboardButton(text="📅 Dars jadvali"), KeyboardButton(text="📞 Markaz bilan aloqa")],
-            [KeyboardButton(text="💰 Oylik to‘lovlar"), KeyboardButton(text="➕ Farzandni bog‘lash")]
+            [KeyboardButton(text="📅 Dars jadvali"), KeyboardButton(text="💰 Oylik to‘lovlar")],
+            [KeyboardButton(text="👨‍👩‍👧‍👦 Farzandlarim"), KeyboardButton(text="➕ Farzandni bog‘lash")],
+            [KeyboardButton(text="📞 Markaz bilan aloqa")],
         ],
         resize_keyboard=True
     )
@@ -242,30 +263,235 @@ async def cmd_my_children(message: types.Message, db: Database, user_role: UserR
     await show_parent_dashboard(message, students, db)
 
 async def show_parent_dashboard(message: types.Message, students: list, db: Database):
-    text = "👨‍👩‍👧‍👦 <b>Sizning farzandlaringiz:</b>\n\n"
-    for s in students:
-        text += f"👤 <b>{escape_html(s['full_name'])}</b>\n"
-        text += f"🏘 Mahalla: <b>{escape_html(s['village_name'])}</b> ({escape_html(s.get('school_name', '-'))})\n"
-        schedules = await db.get_student_schedules(s["id"])
-        if schedules:
-            text += "📅 Dars vaqtlari:\n"
-            for sch in schedules:
-                day_name = WEEKDAYS_UZ[sch["weekday"]]
-                text += f"  • {escape_html(day_name)}: <code>{escape_html(sch['start_time'])} - {escape_html(sch['end_time'])}</code>\n"
+    text = (
+        "👨‍👩‍👧‍👦 <b>Oila kabineti</b>\n\n"
+        "Har bir farzandingiz ma’lumoti alohida kabinetda ko‘rsatiladi. "
+        "Kerakli farzandingizni tanlang:"
+    )
+    rows = [[InlineKeyboardButton(
+        text=f"👤 {str(s['full_name'])[:48]}",
+        callback_data=ParentChildCallback(action="open", student_id=s["id"]).pack(),
+    )] for s in students]
+    await message.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML",
+    )
+
+
+def _parent_child_actions_keyboard(student_id: int) -> InlineKeyboardMarkup:
+    actions = [
+        ("👤 Kabinet bosh sahifasi", "open"),
+        ("📍 Hozirgi holati", "track"),
+        ("📅 Dars jadvali", "schedule"),
+        ("💰 To‘lovlari", "billing"),
+        ("🚫 Bugun kelmaydi", "absence"),
+        ("👨‍👩‍👧‍👦 Boshqa farzandni tanlash", "list"),
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=label,
+            callback_data=ParentChildCallback(action=action, student_id=student_id).pack(),
+        )
+    ] for label, action in actions])
+
+
+async def _parent_child_profile_text(db: Database, student: dict, tg_id: int) -> str:
+    today = now_tz().strftime("%Y-%m-%d")
+    status = await db.get_student_current_status(student["id"], today)
+    schedules = await db.get_student_schedules(student["id"])
+    parent = await db.get_parent_by_telegram_id(tg_id)
+    if not parent:
+        return "Ota-ona akkaunti topilmadi. Qaytadan /start bosing."
+    billing = await db.get_parent_billing_summary(parent["id"], now_tz().strftime("%Y-%m"))
+    child_bill = next(
+        (item for item in billing.get("children", []) if int(item.get("student_id", -1)) == int(student["id"])),
+        None,
+    )
+    text = (
+        f"👤 <b>{escape_html(student['full_name'])}</b>\n"
+        f"🏘 Mahalla: {escape_html(student.get('village_name') or 'Ko‘rsatilmagan')}\n\n"
+        f"📍 <b>Bugungi holat:</b> {escape_html(status.get('status_text', 'Holat mavjud emas'))}\n"
+    )
+    trip = status.get("trip")
+    if trip:
+        direction = "Markazga kelish" if trip.get("direction") == "to_center" else "Uyga qaytish"
+        text += f"🚐 {escape_html(direction)} · {escape_html(trip.get('planned_time') or 'vaqt belgilanmagan')}\n"
+        if trip.get("driver_name"):
+            text += f"🚗 Haydovchi: {escape_html(trip['driver_name'])}"
+            if trip.get("driver_phone"):
+                text += f" · {escape_html(trip['driver_phone'])}"
+            text += "\n"
+    if status.get("reason"):
+        text += f"💬 Izoh: {escape_html(status['reason'])}\n"
+
+    text += "\n📅 <b>Dars jadvali</b>\n"
+    if schedules:
+        for row in sorted(schedules, key=lambda item: item["weekday"]):
+            weekday = row["weekday"]
+            day_name = WEEKDAYS_UZ[weekday] if 0 <= weekday < len(WEEKDAYS_UZ) else "Kun"
+            text += f"• {escape_html(day_name)}: <code>{escape_html(row['start_time'])}–{escape_html(row['end_time'])}</code>\n"
+    else:
+        text += "Dars jadvali kiritilmagan.\n"
+
+    text += "\n💰 <b>To‘lov holati</b>\n"
+    if child_bill:
+        invoice = child_bill.get("current_invoice")
+        if invoice:
+            current_due = int(invoice.get("due", 0))
+            invoice_amount = int(invoice.get("amount", 0)) - int(invoice.get("discount", 0))
+            text += f"{escape_html(_billing_period_label(invoice.get('period', '')))} · {_billing_status(invoice)}\n"
+            text += f"Hisob: {invoice_amount:,} so‘m · To‘langan: {int(invoice.get('paid_total', 0)):,} so‘m\n".replace(",", " ")
+            text += f"Joriy oy qoldig‘i: <b>{current_due:,} so‘m</b>\n".replace(",", " ")
         else:
-            text += "📅 Dars jadvali kiritilmagan.\n"
-        text += "\n"
+            text += "Joriy oy hisobi hali ochilmagan.\n"
+        overdue = child_bill.get("overdue_invoices", [])
+        if overdue:
+            old_due = sum(int(item.get("due", 0)) for item in overdue)
+            text += f"Oldingi oylar qarzi: <b>{old_due:,} so‘m</b>\n".replace(",", " ")
+        total_due = int(child_bill.get("total_due", 0))
+        text += f"Jami shu farzand bo‘yicha qoldiq: <b>{total_due:,} so‘m</b>\n".replace(",", " ")
+    else:
+        text += "Hisob ma’lumoti hozircha yo‘q.\n"
+    text += "\nQuyidagi tugmalardan kerakli bo‘limni tanlang."
+    return text
 
-    text += "<i>Bot orqali farzandingiz qatnovini kuzatishingiz yoki kelmasligini bildirishingiz mumkin.</i>"
 
-    rows = []
-    for s in students:
-        rows.append([InlineKeyboardButton(text=f"🚫 {s['full_name']} bugun kelmaydi", callback_data=AbsentButtonCallback(student_id=s["id"]).pack())])
-    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+async def _parent_child_section_text(db: Database, student: dict, tg_id: int, action: str) -> str:
+    if action == "open":
+        return await _parent_child_profile_text(db, student, tg_id)
+    if action == "track":
+        status = await db.get_student_current_status(student["id"], now_tz().strftime("%Y-%m-%d"))
+        text = (
+            f"📍 <b>{escape_html(student['full_name'])} · bugungi holat</b>\n\n"
+            f"Holati: <b>{escape_html(status.get('status_text', 'Holat mavjud emas'))}</b>"
+        )
+        trip = status.get("trip")
+        if trip:
+            direction = "Markazga kelish" if trip.get("direction") == "to_center" else "Uyga qaytish"
+            text += f"\n🚐 {escape_html(direction)} · {escape_html(trip.get('planned_time') or 'vaqt belgilanmagan')}"
+            if trip.get("driver_name"):
+                text += f"\n🚗 Haydovchi: {escape_html(trip['driver_name'])}"
+                if trip.get("driver_phone"):
+                    text += f" · {escape_html(trip['driver_phone'])}"
+        if status.get("reason"):
+            text += f"\n💬 Izoh: {escape_html(status['reason'])}"
+        return text
+    if action == "schedule":
+        schedules = await db.get_student_schedules(student["id"])
+        text = f"📅 <b>{escape_html(student['full_name'])} · Dars vaqtlari</b>\n\n"
+        if not schedules:
+            return text + "Dars jadvali kiritilmagan."
+        for row in sorted(schedules, key=lambda item: item["weekday"]):
+            weekday = row["weekday"]
+            day_name = WEEKDAYS_UZ[weekday] if 0 <= weekday < len(WEEKDAYS_UZ) else "Kun"
+            text += f"• {escape_html(day_name)}: <code>{escape_html(row['start_time'])} - {escape_html(row['end_time'])}</code>\n"
+        return text
+    if action == "billing":
+        parent = await db.get_parent_by_telegram_id(tg_id)
+        if not parent:
+            return "Ota-ona akkaunti topilmadi. Qaytadan /start bosing."
+        summary = await db.get_parent_billing_summary(parent["id"], now_tz().strftime("%Y-%m"))
+        child = next(
+            (item for item in summary.get("children", []) if int(item.get("student_id", -1)) == int(student["id"])),
+            None,
+        )
+        text = (
+            f"💰 <b>{escape_html(student['full_name'])} · to‘lovlari</b>\n"
+            "To‘lov muddati: har oyning 10-sanasigacha.\n\n"
+        )
+        if not child:
+            return text + "Hisob ma’lumoti hozircha yo‘q."
+        invoice = child.get("current_invoice")
+        if invoice:
+            paid = int(invoice.get("paid_total", 0))
+            due = int(invoice.get("due", 0))
+            amount = int(invoice.get("amount", 0)) - int(invoice.get("discount", 0))
+            invoice_status = _billing_status(invoice)
+            text += (
+                f"📅 {escape_html(_billing_period_label(invoice.get('period', '')))} · {invoice_status}\n"
+                f"Hisob: <b>{amount:,} so‘m</b>\n"
+                f"To‘langan: {paid:,} so‘m\n"
+                f"Qolgan: <b>{due:,} so‘m</b>\n"
+            ).replace(",", " ")
+        else:
+            text += "Joriy oy uchun hisob hali ochilmagan.\n"
+        overdue = child.get("overdue_invoices", [])
+        if overdue:
+            total_old = sum(int(item.get("due", 0)) for item in overdue)
+            text += f"⏳ Oldingi oylar qarzi: <b>{total_old:,} so‘m</b>\n".replace(",", " ")
+            for item in overdue:
+                text += f"• {escape_html(item.get('period', ''))}: {int(item.get('due', 0)):,} so‘m\n".replace(",", " ")
+        return text
+    return "Kerakli bo‘lim topilmadi."
 
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@parent_router.callback_query(ParentChildCallback.filter())
+async def cb_parent_child(
+    callback: types.CallbackQuery,
+    db: Database,
+    state: FSMContext,
+    callback_data: ParentChildCallback | None = None,
+):
+    callback_data = callback_data or ParentChildCallback.unpack(callback.data)
+    parent = await db.get_parent_by_telegram_id(callback.from_user.id)
+    if not parent:
+        await callback.answer("Avval ota-ona sifatida ro‘yxatdan o‘ting.", show_alert=True)
+        return
+    if callback_data.action != "absence":
+        await _clear_absence_reason_state(state)
+    students = await db.get_parent_students(parent["id"])
+    if callback_data.action == "list":
+        if not students:
+            await callback.message.edit_text("Sizga biriktirilgan farzandlar topilmadi.")
+        else:
+            rows = [[InlineKeyboardButton(
+                text=f"👤 {str(student['full_name'])[:48]}",
+                callback_data=ParentChildCallback(action="open", student_id=student["id"]).pack(),
+            )] for student in students]
+            await callback.message.edit_text(
+                "👨‍👩‍👧‍👦 <b>Qaysi farzandingiz kabinetini ochamiz?</b>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                parse_mode="HTML",
+            )
+        await callback.answer()
+        return
+    student = next((row for row in students if int(row["id"]) == callback_data.student_id), None)
+    if not student:
+        await callback.answer("Bu farzand sizning kabinetingizga biriktirilmagan.", show_alert=True)
+        return
+    if callback_data.action == "absence":
+        await state.update_data(absent_student_id=student["id"])
+        await state.set_state(ParentStates.waiting_for_absence_reason)
+        await callback.message.edit_text(
+            f"👤 <b>{escape_html(student['full_name'])}</b> bugun darsga kela olmaslik sababini qisqacha yozing:\n"
+            "<i>(masalan: shamollab qoldi / oilaviy sabab)</i>",
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+    text = await _parent_child_section_text(db, student, callback.from_user.id, callback_data.action)
+    await callback.message.edit_text(
+        text,
+        reply_markup=_parent_child_actions_keyboard(student["id"]),
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 # --- 6. DOIMIY REPLY MENYU HANDLERLARI ---
+
+@parent_router.message(F.text == "👨‍👩‍👧‍👦 Farzandlarim")
+async def parent_family_home(message: types.Message, db: Database, state: FSMContext | None = None):
+    await _clear_absence_reason_state(state)
+    parent = await db.get_parent_by_telegram_id(message.from_user.id)
+    if not parent:
+        await message.answer("Siz hali ota-ona sifatida ro‘yxatdan o‘tmagansiz. /start ni bosing.")
+        return
+    students = await db.get_parent_students(parent["id"])
+    if not students:
+        await message.answer("Sizga biriktirilgan farzandlar topilmadi.", reply_markup=get_parent_menu_kb())
+        return
+    await show_parent_dashboard(message, students, db)
 
 # a) 📍 Farzandim qayerda?
 @parent_router.message(F.text == "📍 Farzandim qayerda?")
@@ -280,28 +506,24 @@ async def parent_track_children(message: types.Message, db: Database, state: FSM
     if not students:
         await message.answer("Sizga biriktirilgan farzandlar topilmadi.", reply_markup=get_parent_menu_kb())
         return
-
-    date_str = now_tz().strftime("%Y-%m-%d")
-    text = "📍 <b>Farzandingizning hozirgi holati:</b>\n\n"
-
-    for s in students:
-        status_info = await db.get_student_current_status(s["id"], date_str)
-        text += f"👤 <b>{escape_html(s['full_name'])}</b> ({escape_html(s['village_name'])})\n"
-        text += f"📌 Holati: <b>{escape_html(status_info['status_text'])}</b>\n"
-
-        trip = status_info.get("trip")
-        if trip:
-            dir_str = "Markazga kelish" if trip.get("direction") == "to_center" else "Uyga qaytish"
-            text += f"🚐 Yo'nalish: <b>{escape_html(dir_str)}</b> (Vaqti: <code>{escape_html(trip.get('planned_time'))}</code>)\n"
-            if trip.get("driver_name"):
-                driver_phone = f" (Tel: {trip['driver_phone']})" if trip.get("driver_phone") else ""
-                text += f"🚗 Haydovchi: <b>{escape_html(trip['driver_name'])}</b>{escape_html(driver_phone)}\n"
-        elif status_info.get("reason"):
-            text += f"💬 Izoh: <i>{escape_html(status_info['reason'])}</i>\n"
-
-        text += "\n"
-
-    await message.answer(text, reply_markup=get_parent_menu_kb(), parse_mode="HTML")
+    if len(students) == 1:
+        student = students[0]
+        text = await _parent_child_section_text(db, student, message.from_user.id, "track")
+        await message.answer(text, reply_markup=_parent_child_actions_keyboard(student["id"]), parse_mode="HTML")
+        return
+    status_lines = ["📍 <b>Farzandlarning bugungi qisqa holati</b> (batafsil ko‘rish uchun tanlang):\n"]
+    rows = [[InlineKeyboardButton(
+        text=f"📍 {str(student['full_name'])[:45]}",
+        callback_data=ParentChildCallback(action="track", student_id=student["id"]).pack(),
+    )] for student in students]
+    for student in students:
+        status = await db.get_student_current_status(student["id"], now_tz().strftime("%Y-%m-%d"))
+        status_lines.append(f"• <b>{escape_html(student['full_name'])}</b> — {escape_html(status.get('status_text', 'Holat mavjud emas'))}")
+    await message.answer(
+        "\n".join(status_lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML",
+    )
 
 # b) 📅 Dars jadvali
 @parent_router.message(F.text == "📅 Dars jadvali")
@@ -316,8 +538,21 @@ async def parent_view_schedule(message: types.Message, db: Database, state: FSMC
     if not students:
         await message.answer("Sizga biriktirilgan farzandlar topilmadi.", reply_markup=get_parent_menu_kb())
         return
+    if len(students) == 1:
+        student = students[0]
+        text = await _parent_child_section_text(db, student, message.from_user.id, "schedule")
+        await message.answer(text, reply_markup=_parent_child_actions_keyboard(student["id"]), parse_mode="HTML")
+        return
 
-    await show_parent_dashboard(message, students, db)
+    rows = [[InlineKeyboardButton(
+        text=f"📅 {str(student['full_name'])[:45]}",
+        callback_data=ParentChildCallback(action="schedule", student_id=student["id"]).pack(),
+    )] for student in students]
+    await message.answer(
+        "📅 <b>Qaysi farzandingiz dars jadvalini ko‘rmoqchisiz?</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML",
+    )
 
 # c) ➕ Yangi farzandni bog'lash
 @parent_router.message(F.text == "➕ Farzandni bog‘lash")
@@ -356,68 +591,25 @@ async def parent_view_billing(message: types.Message, db: Database, state: FSMCo
         await message.answer("Siz hali ota-ona sifatida ro'yxatdan o'tmagansiz. /start ni bosing.")
         return
 
-    period = now_tz().strftime("%Y-%m")
-    summary = await db.get_parent_billing_summary(parent["id"], period)
-    month_names = ("Yanvar", "Fevral", "Mart", "Aprel", "May", "Iyun", "Iyul", "Avgust", "Sentabr", "Oktabr", "Noyabr", "Dekabr")
-
-    def month_label(value: str) -> str:
-        try:
-            year, month = value.split("-")
-            return f"{month_names[int(month) - 1]} {year}"
-        except (ValueError, IndexError):
-            return value
-
-    def money(value: int) -> str:
-        return f"{int(value):,}".replace(",", " ")
-
-    text = (
-        "💰 <b>Oylik to'lovlar</b>\n"
-        "To'lov muddati: har oyning <b>10-sanasigacha</b>.\n"
-        "Hisoblar har bir farzand uchun alohida yuritiladi.\n\n"
+    students = await db.get_parent_students(parent["id"])
+    if not students:
+        await message.answer("Sizga biriktirilgan farzandlar topilmadi.", reply_markup=get_parent_menu_kb())
+        return
+    if len(students) == 1:
+        student = students[0]
+        text = await _parent_child_section_text(db, student, message.from_user.id, "billing")
+        await message.answer(text, reply_markup=_parent_child_actions_keyboard(student["id"]), parse_mode="HTML")
+        return
+    rows = [[InlineKeyboardButton(
+        text=f"💰 {str(student['full_name'])[:45]}",
+        callback_data=ParentChildCallback(action="billing", student_id=student["id"]).pack(),
+    )] for student in students]
+    await message.answer(
+        "💰 <b>To‘lovini ko‘rish uchun farzandingizni tanlang.</b>\n"
+        "Har bir farzandning hisob-kitobi alohida ko‘rsatiladi.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML",
     )
-    has_invoice = False
-    for child in summary["children"]:
-        text += f"👤 <b>{escape_html(child['name'])}</b>\n"
-        if not child["active"]:
-            text += "ℹ️ O'quvchi hozir faol ro'yxatda emas.\n"
-        invoice = child["current_invoice"]
-        if invoice:
-            has_invoice = True
-            if invoice["status"] == "waived":
-                status = "Hisob bekor qilingan"
-            elif invoice["amount"] == 0 and invoice["due"] == 0:
-                status = "Hozircha qarz yo'q"
-            elif invoice["due"] == 0:
-                status = "To'langan"
-            elif invoice["paid_total"] > 0:
-                status = "Qisman to'langan"
-            else:
-                status = "To'lanmagan"
-            text += f"📅 {escape_html(month_label(invoice['period']))}: {status}\n"
-            if invoice["billing_mode"] == "attendance":
-                text += f"🗓 Jadval bo'yicha: {invoice['lesson_count']} ta dars × {money(invoice['lesson_rate'])} so'm\n"
-            text += f"Hisob: <b>{money(invoice['amount'] - invoice['discount'])} so'm</b> · To'langan: {money(invoice['paid_total'])} so'm\n"
-            text += f"Qoldiq: <b>{money(invoice['due'])} so'm</b>\n"
-        else:
-            text += f"📅 {escape_html(month_label(period))}: hisob dars jadvali bo'yicha avtomatik ochiladi.\n"
-        old_invoices = child["overdue_invoices"]
-        if old_invoices:
-            has_invoice = True
-            old_total = sum(invoice["due"] for invoice in old_invoices)
-            text += f"⏳ Oldingi oylar qarzi ({len(old_invoices)} ta hisob): <b>{money(old_total)} so'm</b>\n"
-            for old_invoice in old_invoices[:3]:
-                text += f"  • {escape_html(month_label(old_invoice['period']))}: {money(old_invoice['due'])} so'm\n"
-            if len(old_invoices) > 3:
-                text += f"  • Yana {len(old_invoices) - 3} ta oldingi hisob Mini App'da ko'rinadi.\n"
-        text += "\n"
-
-    text += f"<b>Jami qolgan qarz: {money(summary['total_due'])} so'm</b>\n"
-    if not has_invoice:
-        text += "Hisoblar o'quvchi qo'shilganda va oy boshida avtomatik hisoblanadi. Kelmagan dars kunlari ham hisobga kiradi."
-    elif summary["total_due"] == 0:
-        text += "Hozircha to'lanmagan qarz yo'q."
-
-    await message.answer(text, reply_markup=get_parent_menu_kb(), parse_mode="HTML")
 
 # e) 📞 Markaz bilan aloqa
 @parent_router.message(F.text == "📞 Markaz bilan aloqa")

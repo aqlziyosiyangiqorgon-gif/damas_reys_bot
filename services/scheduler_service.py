@@ -3,6 +3,7 @@ import asyncio
 import os
 import logging
 import re
+import tempfile
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 from zoneinfo import ZoneInfo
@@ -15,6 +16,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import settings
 from database.db import Database
 from services.trip_builder import TripBuilder
+from services.driver_route_pdf import build_driver_daily_pdf, estimate_pickup_times
 from models.enums import TripDirection, TripStatus
 from models.callbacks import ApproveTripsCallback, DriverStartTripCallback
 from utils.text import escape_html
@@ -61,7 +63,8 @@ class SchedulerService:
         stats = {
             "first_reminders": 0,
             "second_reminders": 0,
-            "escalations": 0
+            "escalations": 0,
+            "advance_pdf_reminders": 0,
         }
 
         trips = await self.db.get_trips_needing_reminder(now_dt)
@@ -90,7 +93,55 @@ class SchedulerService:
             except Exception as exc:
                 logger.error("Reminder processing failed for trip %s (%s)", trip.get("id"), type(exc).__name__)
 
+        try:
+            stats["advance_pdf_reminders"] = await self.send_driver_advance_reminders(now_dt)
+        except Exception as exc:
+            logger.error("Driver advance PDF reminders failed (%s)", type(exc).__name__)
+
         return stats
+
+    async def send_driver_advance_reminders(self, now_dt: Optional[datetime] = None) -> int:
+        """Send route PDFs 50 minutes before the earliest lesson in each trip."""
+        if self.bot is None:
+            return 0
+        now_dt = now_dt or now_tz()
+        trips = await self.db.get_driver_advance_reminder_trips(now_dt)
+        grouped: Dict[int, List[dict]] = {}
+        for trip in trips:
+            driver_tg_id = trip.get("driver_tg_id")
+            if driver_tg_id:
+                grouped.setdefault(int(driver_tg_id), []).append(trip)
+
+        sent_count = 0
+        sent_at = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        for driver_tg_id, driver_trips in grouped.items():
+            date_str = driver_trips[0]["date"]
+            driver_name = driver_trips[0].get("driver_name") or "Haydovchi"
+            trip_ids = [int(trip["id"]) for trip in driver_trips]
+            try:
+                pdf_data = await asyncio.to_thread(
+                    build_driver_daily_pdf, driver_trips, driver_name, date_str
+                )
+                with tempfile.TemporaryDirectory(prefix="aql-driver-advance-") as temp_dir:
+                    path = os.path.join(temp_dir, f"darsdan_50_daqiqa_oldin_{date_str}.pdf")
+                    with open(path, "wb") as pdf_file:
+                        pdf_file.write(pdf_data)
+                    status = await safe_send_document(
+                        self.bot,
+                        driver_tg_id,
+                        path,
+                        f"📋 Dars boshlanishidan 50 daqiqa oldingi reja | {date_str}\n"
+                        "Mahalla, taxminiy olish vaqti va dars boshlanish vaqti PDFda.",
+                    )
+                if status != "sent":
+                    logger.warning("Driver advance PDF delivery failed (%s)", status)
+                    continue
+                for trip_id in trip_ids:
+                    await self.db.mark_driver_advance_reminder_sent(trip_id, sent_at)
+                sent_count += len(trip_ids)
+            except Exception as exc:
+                logger.error("Driver advance PDF failed for route group (%s)", type(exc).__name__)
+        return sent_count
 
     async def send_billing_reminders(self, now_dt: Optional[datetime] = None) -> Dict[str, int]:
         """Send one grouped payment reminder per parent on the due-date schedule."""
@@ -205,21 +256,50 @@ class SchedulerService:
         if self.bot and driver_tg_id:
             await safe_send(self.bot, driver_tg_id, text, reply_markup=kb, parse_mode="HTML")
 
-        # Ota-onalarga ham reysga oid eslatma yuboramiz; haydovchi tugmasi ularga ko'rsatilmaydi.
-        parent_ids = {
-            int(parent_id)
-            for item in trip.get("items", [])
-            for parent_id in str(item.get("parent_telegram_ids") or "").split(",")
-            if parent_id.strip().isdigit()
-        }
-        if self.bot:
-            parent_text = (
-                f"{header}\n\n"
-                f"🚐 Farzandingizning {'markazga kelish' if trip['direction'] == TripDirection.TO_CENTER.value else 'uyga qaytish'} reysi"
-                f" rejalashtirilgan vaqti: <b>{escape_html(trip['planned_time'])}</b>.\n"
-                f"Iltimos, tayyor bo'lib turing."
-            )
+        # Ota-onaga shu reysdagi o'z farzandining taxminiy olish vaqtini ko'rsatamiz.
+        parent_lines: Dict[int, List[str]] = {}
+        if trip["direction"] == TripDirection.TO_CENTER.value:
+            pickup_times = estimate_pickup_times(trip)
+            for item in trip.get("items", []):
+                pickup_time = pickup_times.get(int(item.get("id", 0))) or trip.get("planned_time")
+                if not pickup_time:
+                    continue
+                line = (
+                    f"• <b>{escape_html(item.get('full_name'))}</b> — taxminan "
+                    f"<b>{escape_html(pickup_time)}</b> da "
+                    f"{escape_html(item.get('village_name'))} mahallasidan olinadi"
+                )
+                for parent_id in str(item.get("parent_telegram_ids") or "").split(","):
+                    if parent_id.strip().isdigit():
+                        parent_lines.setdefault(int(parent_id.strip()), []).append(line)
+        else:
+            parent_ids = {
+                int(parent_id)
+                for item in trip.get("items", [])
+                for parent_id in str(item.get("parent_telegram_ids") or "").split(",")
+                if parent_id.strip().isdigit()
+            }
             for parent_id in parent_ids:
+                parent_lines[parent_id] = []
+
+        if self.bot:
+            for parent_id, lines in parent_lines.items():
+                if trip["direction"] == TripDirection.TO_CENTER.value:
+                    children_text = "\n".join(dict.fromkeys(lines))
+                    parent_text = (
+                        f"{header}\n\n"
+                        "🚐 Farzandingizni markazga olib borish reysi.\n"
+                        f"{children_text}\n\n"
+                        "Ko'rsatilgan vaqt — haydovchining mahallangizga yetib kelish taxmini. "
+                        "Iltimos, shu vaqtdan oldin tayyor bo'ling."
+                    )
+                else:
+                    parent_text = (
+                        f"{header}\n\n"
+                        f"🚐 Farzandingizning uyga qaytish rejalashtirilgan vaqti: "
+                        f"<b>{escape_html(trip['planned_time'])}</b>.\n"
+                        "Iltimos, tayyor bo'lib turing."
+                    )
                 await safe_send(self.bot, parent_id, parent_text, parse_mode="HTML")
 
     async def _send_admin_escalation(self, trip: dict):

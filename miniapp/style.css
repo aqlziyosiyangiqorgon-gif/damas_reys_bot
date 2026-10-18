@@ -283,6 +283,16 @@ h1 { margin: 0; color: var(--brand-navy); font-size: 17px; font-weight: 780; let
 .parent-child-summary::-webkit-details-marker { display: none; }
 .parent-child-summary::after { content: "⌄"; margin-left: auto; color: var(--muted); font-size: 20px; transition: transform .16s ease; }
 .parent-child-card[open] > .parent-child-summary::after { transform: rotate(180deg); }
+.parent-child-choice { display: grid; gap: 11px; padding-bottom: 13px; }
+.parent-child-choice > .parent-child-summary { cursor: default; }
+.parent-child-choice > .parent-child-summary::after { content: none; }
+.parent-child-choice > .status-line { margin: 0 13px; }
+.parent-child-choice > .action-button { margin: 0 13px; width: calc(100% - 26px); }
+.parent-child-switcher { display: flex; margin: 2px 0 9px; }
+.parent-child-switcher .action-button { width: 100%; }
+.parent-child-tabs { display: flex; gap: 8px; overflow-x: auto; padding: 2px 0 8px; scrollbar-width: thin; }
+.parent-child-tab { flex: 0 0 auto; max-width: 190px; overflow: hidden; padding: 9px 13px; border: 1px solid var(--border); border-radius: 999px; color: var(--brand-navy); background: var(--surface); font: inherit; font-size: 12px; font-weight: 750; text-overflow: ellipsis; white-space: nowrap; }
+.parent-child-tab.active { border-color: var(--brand-navy); color: #fff; background: var(--brand-navy); }
 .parent-child-name { display: grid; min-width: 0; flex: 1; gap: 3px; }
 .parent-child-name strong { overflow-wrap: anywhere; font-size: 14px; line-height: 1.3; }
 .parent-child-name small { color: var(--muted); font-size: 11px; }

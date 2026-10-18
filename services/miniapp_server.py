@@ -19,6 +19,7 @@ from config import settings
 from models.enums import TripDirection, TripItemStatus, TripStatus, UserRole
 from services.miniapp_auth import MiniAppAuthError, validate_init_data
 from services.notify_service import NotifyService
+from services.payment_receipt import send_payment_receipt
 from services.telegram_safe import safe_send, safe_send_photo
 from utils.clock import now_tz
 from utils.text import escape_html
@@ -749,14 +750,24 @@ async def admin_action(request: web.Request) -> web.Response:
         summary = await db.get_invoice_summary(student_id, period)
         if not summary:
             raise MiniAppRequestError("Avval oylik hisob oching.", 404)
-        ok, reason = await db.record_payment(
+        ok, reason, payment_id = await db.record_payment_with_id(
             summary["id"], amount, method, telegram_id, now_tz().strftime("%Y-%m-%d %H:%M:%S")
         )
         if not ok:
             messages = {"invalid_amount": "To'lov summasi noto'g'ri.", "invalid_method": "To'lov turini tanlang.",
                         "waived": "Bu hisob bekor qilingan.", "overpayment": "To'lov qolgan qarzdan oshib ketdi."}
             raise MiniAppRequestError(messages.get(reason, "To'lov saqlanmadi."), 409)
-        result = {"message": "To'lov qayd etildi."}
+        delivery = await send_payment_receipt(
+            db, request.app.get(BOT_KEY), payment_id
+        ) if payment_id is not None else "failed"
+        receipt_messages = {
+            "sent": "To'lov qayd etildi, chek ota-onaga yuborildi.",
+            "partial": "To'lov qayd etildi, chek ayrim ota-onalarga yuborildi.",
+            "no_parent": "To'lov saqlandi, lekin ota-onaning Telegram akkaunti ulanmagan.",
+            "unavailable": "To'lov saqlandi, lekin chek yuborish xizmati mavjud emas.",
+            "failed": "To'lov saqlandi, lekin chek yuborilmadi.",
+        }
+        result = {"message": receipt_messages.get(delivery, "To'lov qayd etildi.")}
 
     elif kind == "apply_discount":
         student_id = _admin_int(body, "student_id", minimum=1)
