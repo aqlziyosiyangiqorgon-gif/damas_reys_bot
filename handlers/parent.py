@@ -72,10 +72,44 @@ def get_parent_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📍 Farzandim qayerda?"), KeyboardButton(text="🚫 Bugun kelmaydi")],
-            [KeyboardButton(text="📅 Dars jadvali"), KeyboardButton(text="📞 Markaz bilan aloqa")]
+            [KeyboardButton(text="📅 Dars jadvali"), KeyboardButton(text="📞 Markaz bilan aloqa")],
+            [KeyboardButton(text="💰 Oylik to‘lovlar"), KeyboardButton(text="➕ Farzandni bog‘lash")]
         ],
         resize_keyboard=True
     )
+
+
+async def prompt_unlinked_children(
+    message: types.Message,
+    db: Database,
+    parent_id: int,
+    phone: str,
+    candidates: list[dict] | None = None,
+) -> tuple[int, int]:
+    """Ask the parent to confirm every newly matched child sharing their registered phone."""
+    matches = candidates if candidates is not None else await db.find_students_by_phone(phone)
+    prompted = 0
+    for student in matches:
+        if await db.is_student_linked_to_parent(student["id"], parent_id):
+            continue
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="✅ Ha",
+                callback_data=ConfirmChildCallback(student_id=student["id"], parent_id=parent_id).pack(),
+            ),
+            InlineKeyboardButton(
+                text="❌ Yo'q",
+                callback_data=RejectChildCallback(student_id=student["id"], parent_id=parent_id).pack(),
+            ),
+        ]])
+        await message.answer(
+            f"👤 Farzandingiz <b>{escape_html(student['full_name'])}</b> "
+            f"({escape_html(student['village_name'])}, {escape_html(student.get('school_name', ''))})mi?",
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+        prompted += 1
+    return len(matches), prompted
 
 # --- 2. Kontakt qabul qilish va tekshirish ---
 @parent_router.message(F.contact)
@@ -117,23 +151,8 @@ async def process_parent_contact(message: types.Message, db: Database):
         reply_markup=get_parent_menu_kb()
     )
 
-    # Topilgan har bir bola uchun alohida tasdiqlash tugmasi chiqarish
-    for st in matched_students:
-        is_already_linked = await db.is_student_linked_to_parent(st["id"], parent_id)
-        if is_already_linked:
-            continue
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Ha", callback_data=ConfirmChildCallback(student_id=st["id"], parent_id=parent_id).pack()),
-                InlineKeyboardButton(text="❌ Yo'q", callback_data=RejectChildCallback(student_id=st["id"], parent_id=parent_id).pack())
-            ]
-        ])
-        await message.answer(
-            f"👤 Farzandingiz <b>{escape_html(st['full_name'])}</b> ({escape_html(st['village_name'])}, {escape_html(st.get('school_name', ''))})mi?",
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
+    # Bir raqamga ulangan barcha farzandlar alohida tasdiqlanadi.
+    await prompt_unlinked_children(message, db, parent_id, norm_phone, matched_students)
 
 # --- 3. Farzandni tasdiqlash callbacki ---
 @parent_router.callback_query(ConfirmChildCallback.filter())
@@ -300,7 +319,107 @@ async def parent_view_schedule(message: types.Message, db: Database, state: FSMC
 
     await show_parent_dashboard(message, students, db)
 
-# c) 📞 Markaz bilan aloqa
+# c) ➕ Yangi farzandni bog'lash
+@parent_router.message(F.text == "➕ Farzandni bog‘lash")
+async def parent_link_another_child(message: types.Message, db: Database, state: FSMContext | None = None):
+    await _clear_absence_reason_state(state)
+    parent = await db.get_parent_by_telegram_id(message.from_user.id)
+    if not parent:
+        await message.answer("Avval /start orqali telefon raqamingizni tasdiqlang.")
+        return
+
+    matched_count, prompted_count = await prompt_unlinked_children(
+        message, db, parent["id"], parent["phone"]
+    )
+    if prompted_count:
+        await message.answer(
+            f"{prompted_count} ta yangi farzandni tasdiqlash uchun yuqoridagi ✅ Ha tugmasini bosing.",
+            reply_markup=get_parent_menu_kb(),
+        )
+    elif matched_count:
+        await message.answer(
+            "Telefon raqamingizga mos barcha faol farzandlar allaqachon bog‘langan.",
+            reply_markup=get_parent_menu_kb(),
+        )
+    else:
+        await message.answer(
+            "Bu telefon raqamiga mos faol o‘quvchi topilmadi. Raqam bazada to‘g‘ri kiritilganini markaz adminidan tekshirtiring.",
+            reply_markup=get_parent_menu_kb(),
+        )
+
+# d) 💰 Oylik to'lovlar va farzandlar bo'yicha qarzdorlik
+@parent_router.message(F.text == "💰 Oylik to‘lovlar")
+async def parent_view_billing(message: types.Message, db: Database, state: FSMContext | None = None):
+    await _clear_absence_reason_state(state)
+    parent = await db.get_parent_by_telegram_id(message.from_user.id)
+    if not parent:
+        await message.answer("Siz hali ota-ona sifatida ro'yxatdan o'tmagansiz. /start ni bosing.")
+        return
+
+    period = now_tz().strftime("%Y-%m")
+    summary = await db.get_parent_billing_summary(parent["id"], period)
+    month_names = ("Yanvar", "Fevral", "Mart", "Aprel", "May", "Iyun", "Iyul", "Avgust", "Sentabr", "Oktabr", "Noyabr", "Dekabr")
+
+    def month_label(value: str) -> str:
+        try:
+            year, month = value.split("-")
+            return f"{month_names[int(month) - 1]} {year}"
+        except (ValueError, IndexError):
+            return value
+
+    def money(value: int) -> str:
+        return f"{int(value):,}".replace(",", " ")
+
+    text = (
+        "💰 <b>Oylik to'lovlar</b>\n"
+        "To'lov muddati: har oyning <b>10-sanasigacha</b>.\n"
+        "Hisoblar har bir farzand uchun alohida yuritiladi.\n\n"
+    )
+    has_invoice = False
+    for child in summary["children"]:
+        text += f"👤 <b>{escape_html(child['name'])}</b>\n"
+        if not child["active"]:
+            text += "ℹ️ O'quvchi hozir faol ro'yxatda emas.\n"
+        invoice = child["current_invoice"]
+        if invoice:
+            has_invoice = True
+            if invoice["status"] == "waived":
+                status = "Hisob bekor qilingan"
+            elif invoice["amount"] == 0 and invoice["due"] == 0:
+                status = "Hozircha qarz yo'q"
+            elif invoice["due"] == 0:
+                status = "To'langan"
+            elif invoice["paid_total"] > 0:
+                status = "Qisman to'langan"
+            else:
+                status = "To'lanmagan"
+            text += f"📅 {escape_html(month_label(invoice['period']))}: {status}\n"
+            if invoice["billing_mode"] == "attendance":
+                text += f"🗓 Jadval bo'yicha: {invoice['lesson_count']} ta dars × {money(invoice['lesson_rate'])} so'm\n"
+            text += f"Hisob: <b>{money(invoice['amount'] - invoice['discount'])} so'm</b> · To'langan: {money(invoice['paid_total'])} so'm\n"
+            text += f"Qoldiq: <b>{money(invoice['due'])} so'm</b>\n"
+        else:
+            text += f"📅 {escape_html(month_label(period))}: hisob dars jadvali bo'yicha avtomatik ochiladi.\n"
+        old_invoices = child["overdue_invoices"]
+        if old_invoices:
+            has_invoice = True
+            old_total = sum(invoice["due"] for invoice in old_invoices)
+            text += f"⏳ Oldingi oylar qarzi ({len(old_invoices)} ta hisob): <b>{money(old_total)} so'm</b>\n"
+            for old_invoice in old_invoices[:3]:
+                text += f"  • {escape_html(month_label(old_invoice['period']))}: {money(old_invoice['due'])} so'm\n"
+            if len(old_invoices) > 3:
+                text += f"  • Yana {len(old_invoices) - 3} ta oldingi hisob Mini App'da ko'rinadi.\n"
+        text += "\n"
+
+    text += f"<b>Jami qolgan qarz: {money(summary['total_due'])} so'm</b>\n"
+    if not has_invoice:
+        text += "Hisoblar o'quvchi qo'shilganda va oy boshida avtomatik hisoblanadi. Kelmagan dars kunlari ham hisobga kiradi."
+    elif summary["total_due"] == 0:
+        text += "Hozircha to'lanmagan qarz yo'q."
+
+    await message.answer(text, reply_markup=get_parent_menu_kb(), parse_mode="HTML")
+
+# e) 📞 Markaz bilan aloqa
 @parent_router.message(F.text == "📞 Markaz bilan aloqa")
 async def parent_center_contact(message: types.Message, state: FSMContext | None = None):
     await _clear_absence_reason_state(state)

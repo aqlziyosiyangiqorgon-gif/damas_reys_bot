@@ -91,15 +91,37 @@ async def cmd_start(message: types.Message, user_role: UserRole, db: Database):
         parent = await db.get_parent_by_telegram_id(message.from_user.id)
         if parent:
             students = await db.get_parent_students(parent["id"])
+            from handlers.parent import (
+                get_parent_menu_kb,
+                prompt_unlinked_children,
+                show_parent_dashboard,
+            )
             if students:
-                from handlers.parent import show_parent_dashboard, get_parent_menu_kb
                 await answer_start(
                     message,
                     "👨‍👩‍👧‍👦 <b>AQL ZIYOSI</b> ota-ona kabinetiga xush kelibsiz!",
                     reply_markup=get_parent_menu_kb()
                 )
                 await show_parent_dashboard(message, students, db)
-                return
+            else:
+                await answer_start(
+                    message,
+                    "👨‍👩‍👧‍👦 <b>AQL ZIYOSI</b> ota-ona kabinetiga xush kelibsiz!\n\n"
+                    "Telefon raqamingizga mos yangi farzandlar bo‘lsa, ularni tasdiqlash uchun xabar yuboramiz.",
+                    reply_markup=get_parent_menu_kb(),
+                )
+
+            matched_count, prompted_count = await prompt_unlinked_children(
+                message, db, parent["id"], parent["phone"]
+            )
+            if not students and not prompted_count:
+                if matched_count:
+                    await message.answer("Topilgan farzandlar allaqachon bog‘langan, lekin faol ro‘yxatda yo‘q.")
+                else:
+                    await message.answer(
+                        "Telefon raqamingizga mos faol o‘quvchi topilmadi. Markaz adminidan raqamni tekshirtiring."
+                    )
+            return
 
     # UserRole.GUEST: Ro'yxatdan o'tmagan ota-onadan telefon so'rash
     from handlers.parent import get_contact_keyboard

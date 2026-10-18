@@ -55,9 +55,12 @@ async def test_scheduler_jobs_have_timezone_and_execution_guards():
         scheduler.start()
         jobs = {job.id: job for job in scheduler.scheduler.get_jobs()}
 
-        assert set(jobs) == {"daily_plan", "auto_approve", "reminders", "backup_db"}
+        assert set(jobs) == {
+            "daily_plan", "auto_approve", "reminders", "billing_reminders",
+            "monthly_billing", "backup_db",
+        }
         for job in jobs.values():
-            assert job.misfire_grace_time == 600
+            assert job.misfire_grace_time in (600, 3600)
             assert job.coalesce is True
             assert job.max_instances == 1
 

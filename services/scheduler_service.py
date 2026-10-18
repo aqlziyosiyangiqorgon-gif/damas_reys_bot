@@ -92,6 +92,93 @@ class SchedulerService:
 
         return stats
 
+    async def send_billing_reminders(self, now_dt: Optional[datetime] = None) -> Dict[str, int]:
+        """Send one grouped payment reminder per parent on the due-date schedule."""
+        now_dt = now_dt or now_tz()
+        day = now_dt.day
+        reminder_day = 5 if day == 5 else day if day >= 10 and (day - 10) % 7 == 0 else None
+        stats = {"eligible_parents": 0, "sent": 0, "failed": 0, "skipped": 0}
+        if reminder_day is None or self.bot is None:
+            return stats
+
+        period = now_dt.strftime("%Y-%m")
+        rows = await self.db.get_billing_reminder_candidates(period)
+        if not rows:
+            return stats
+
+        grouped: Dict[int, Dict[str, Any]] = {}
+        for row in rows:
+            parent_id = int(row["parent_id"])
+            group = grouped.setdefault(parent_id, {
+                "telegram_id": int(row["telegram_id"]),
+                "students": {},
+            })
+            due = max(0, int(row["amount"]) - int(row["discount"]) - int(row["paid_total"]))
+            if due:
+                student_id = int(row["student_id"])
+                student = group["students"].setdefault(student_id, {
+                    "name": row["student_name"], "current_due": 0, "previous_due": 0,
+                })
+                key = "current_due" if row["period"] == period else "previous_due"
+                student[key] += due
+
+        month_names = ("Yanvar", "Fevral", "Mart", "Aprel", "May", "Iyun", "Iyul", "Avgust", "Sentabr", "Oktabr", "Noyabr", "Dekabr")
+
+        def money(value: int) -> str:
+            return f"{int(value):,}".replace(",", " ")
+
+        current_month = month_names[now_dt.month - 1]
+        for parent_id, group in grouped.items():
+            students = list(group["students"].values())
+            if not students:
+                continue
+            stats["eligible_parents"] += 1
+            try:
+                claimed = await self.db.claim_billing_reminder(parent_id, period, reminder_day)
+                if not claimed:
+                    stats["skipped"] += 1
+                    continue
+
+                if day == 5:
+                    heading = f"⏰ Oylik to'lov muddati yaqinlashmoqda. {current_month} oyi to'lovi 10-sanasigacha amalga oshiriladi."
+                elif day == 10:
+                    heading = f"📌 Bugun — {current_month} oyi to'lovi uchun oxirgi kun."
+                else:
+                    heading = "⚠️ To'lov muddati o'tgan qarzdorlik bo'yicha eslatma."
+
+                lines = ["💰 Oylik to'lov eslatmasi", heading, "", "Farzandlar bo'yicha qolgan summalar:"]
+                total_due = 0
+                for student in students:
+                    child_due = student["current_due"] + student["previous_due"]
+                    total_due += child_due
+                    child_parts = []
+                    if student["current_due"]:
+                        child_parts.append(f"{current_month}: {money(student['current_due'])} so'm")
+                    if student["previous_due"]:
+                        child_parts.append(f"oldingi oylar qarzi: {money(student['previous_due'])} so'm")
+                    lines.append(f"• {student['name']} — {'; '.join(child_parts)} · jami {money(child_due)} so'm")
+                lines.extend(("", f"Jami qolgan qarz: {money(total_due)} so'm"))
+
+                status = await safe_send(self.bot, group["telegram_id"], "\n".join(lines), parse_mode=None)
+                await self.db.update_billing_reminder_status(parent_id, period, reminder_day, status)
+                if status == "sent":
+                    stats["sent"] += 1
+                else:
+                    stats["failed"] += 1
+                    logger.warning("Billing reminder delivery failed (%s)", status)
+            except Exception as exc:
+                stats["failed"] += 1
+                logger.error("Billing reminder failed for parent %s (%s)", parent_id, type(exc).__name__)
+
+        return stats
+
+    async def run_monthly_billing(self, period: Optional[str] = None) -> Dict[str, int]:
+        """Open missing invoices from scheduled lessons, independent of attendance."""
+        result = await self.db.ensure_monthly_billing(period)
+        if result["created"]:
+            logger.info("Avtomatik dars hisoblari yaratildi: %s ta", result["created"])
+        return result
+
     async def _send_driver_reminder(self, trip: dict, reminder_num: int):
         trip_id = trip["id"]
         dir_text = "Markazga kelish" if trip["direction"] == TripDirection.TO_CENTER.value else "Uyga qaytish"
@@ -320,6 +407,24 @@ class SchedulerService:
             IntervalTrigger(minutes=1, timezone=self.timezone),
             id="reminders",
             misfire_grace_time=600,
+            coalesce=True,
+            max_instances=1,
+        )
+        # Qarzdorlik eslatmasi: 5-kuni, 10-kuni va undan keyin har 7 kunda.
+        self.scheduler.add_job(
+            self.send_billing_reminders,
+            CronTrigger(hour=9, minute=0, timezone=self.timezone),
+            id="billing_reminders",
+            misfire_grace_time=3600,
+            coalesce=True,
+            max_instances=1,
+        )
+        # Har kuni tekshiradi: oy boshidagi uzilish bo'lsa ham yangi oy hisobi ochiladi.
+        self.scheduler.add_job(
+            self.run_monthly_billing,
+            CronTrigger(hour=0, minute=5, timezone=self.timezone),
+            id="monthly_billing",
+            misfire_grace_time=3600,
             coalesce=True,
             max_instances=1,
         )

@@ -44,6 +44,11 @@ async def main():
     db = Database(db_path)
     await db.init_db()
     logger.info(f"Ma'lumotlar bazasi initsializatsiya qilindi: {db_path}")
+    billing_result = await db.ensure_monthly_billing()
+    logger.info(
+        "Joriy oy uchun avtomatik to'lovlar tekshirildi: %s ta yangi hisob, %s ta jadvalsiz o'quvchi",
+        billing_result["created"], billing_result["skipped"],
+    )
 
     bot = Bot(
         token=settings.BOT_TOKEN,

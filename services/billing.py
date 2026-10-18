@@ -2,6 +2,8 @@
 
 from datetime import date, timedelta
 
+LESSON_RATE = 5_000
+
 
 def tariff_for_days(days_per_week: int) -> int | None:
     """Return the known weekly tariff, or None when it must be entered manually."""

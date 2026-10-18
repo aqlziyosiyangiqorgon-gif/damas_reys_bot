@@ -2,9 +2,11 @@ from utils.clock import now_tz
 import os
 import json
 import aiosqlite
-from datetime import datetime, timedelta
+import calendar
+from datetime import date, datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 from models.enums import UserRole
+from services.billing import LESSON_RATE
 from utils.time_validation import validate_schedule_times
 
 # Boshlang'ich zonalar va ularga tegishli 10 ta mahalla
@@ -270,9 +272,23 @@ class Database:
                 amount INTEGER NOT NULL CHECK (amount >= 0),
                 discount INTEGER NOT NULL DEFAULT 0 CHECK (discount >= 0),
                 status TEXT NOT NULL CHECK (status IN ('unpaid', 'paid', 'waived')),
+                billing_mode TEXT NOT NULL DEFAULT 'manual' CHECK (billing_mode IN ('manual', 'attendance')),
                 created_at TEXT NOT NULL,
                 UNIQUE (student_id, period)
             );
+
+            CREATE TABLE IF NOT EXISTS invoice_lesson_days (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE RESTRICT,
+                student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE RESTRICT,
+                lesson_date TEXT NOT NULL,
+                amount INTEGER NOT NULL CHECK (amount > 0),
+                created_at TEXT NOT NULL,
+                UNIQUE (student_id, lesson_date)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_invoice_lesson_days_invoice_id
+            ON invoice_lesson_days(invoice_id);
 
             CREATE TABLE IF NOT EXISTS payments (
                 id INTEGER PRIMARY KEY,
@@ -290,6 +306,16 @@ class Database:
                 reason TEXT NOT NULL,
                 admin_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS billing_reminder_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_id INTEGER NOT NULL REFERENCES parents(id) ON DELETE RESTRICT,
+                period TEXT NOT NULL CHECK (length(period) = 7),
+                reminder_day INTEGER NOT NULL CHECK (reminder_day BETWEEN 1 AND 31),
+                attempted_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                UNIQUE (parent_id, period, reminder_day)
             );
             """)
 
@@ -323,7 +349,197 @@ class Database:
                     "ALTER TABLE students ADD COLUMN driver_id INTEGER REFERENCES drivers(id) ON DELETE SET NULL"
                 )
 
+            cur_col = await conn.execute("PRAGMA table_info(invoices)")
+            invoice_columns = [row[1] for row in await cur_col.fetchall()]
+            if "billing_mode" not in invoice_columns:
+                await conn.execute(
+                    "ALTER TABLE invoices ADD COLUMN billing_mode TEXT NOT NULL DEFAULT 'manual'"
+                )
+
             await conn.commit()
+        finally:
+            await conn.close()
+
+    @staticmethod
+    def _billing_period_dates(period: str) -> Tuple[date, date]:
+        try:
+            first_day = datetime.strptime(period, "%Y-%m").date().replace(day=1)
+        except ValueError as exc:
+            raise ValueError("period must use YYYY-MM format") from exc
+        if first_day.strftime("%Y-%m") != period:
+            raise ValueError("period must use YYYY-MM format")
+        last_day = first_day.replace(day=calendar.monthrange(first_day.year, first_day.month)[1])
+        return first_day, last_day
+
+    async def _ensure_attendance_invoice(
+        self,
+        conn: aiosqlite.Connection,
+        student_id: int,
+        period: str,
+        effective_from: date,
+        weekdays: set[int],
+    ) -> bool:
+        """Create a scheduled-lesson invoice, charging 5,000 so'm per planned class."""
+        if not weekdays:
+            return False
+        period_start, period_end = self._billing_period_dates(period)
+        if effective_from > period_end:
+            return False
+
+        cur = await conn.execute(
+            "SELECT id, billing_mode FROM invoices WHERE student_id = ? AND period = ?",
+            (student_id, period),
+        )
+        existing_invoice = await cur.fetchone()
+        if existing_invoice and existing_invoice["billing_mode"] != "attendance":
+            # Old/manual invoices are preserved without layering a second charge on them.
+            return False
+
+        if existing_invoice:
+            invoice_id = int(existing_invoice["id"])
+        else:
+            cur = await conn.execute(
+                "INSERT INTO invoices (student_id, period, amount, status, billing_mode, created_at) "
+                "VALUES (?, ?, 0, 'paid', 'attendance', ?)",
+                (student_id, period, now_tz().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            invoice_id = int(cur.lastrowid)
+
+        charge_from = max(period_start, effective_from)
+        max_lesson_days = len(weekdays) * 4
+        cur = await conn.execute(
+            "SELECT lesson_date FROM invoice_lesson_days WHERE invoice_id = ?", (invoice_id,)
+        )
+        billed_dates = {row[0] for row in await cur.fetchall()}
+        existing_lesson_count = len(billed_dates)
+        remaining_capacity = max(0, max_lesson_days - existing_lesson_count)
+
+        lesson_dates: List[date] = []
+        current_day = charge_from
+        while current_day <= period_end and len(lesson_dates) < remaining_capacity:
+            if current_day.weekday() in weekdays and current_day.isoformat() not in billed_dates:
+                lesson_dates.append(current_day)
+            current_day += timedelta(days=1)
+
+        created_at = now_tz().strftime("%Y-%m-%d %H:%M:%S")
+        for lesson_date in lesson_dates:
+            await conn.execute(
+                "INSERT OR IGNORE INTO invoice_lesson_days "
+                "(invoice_id, student_id, lesson_date, amount, created_at) VALUES (?, ?, ?, ?, ?)",
+                (invoice_id, student_id, lesson_date.isoformat(), LESSON_RATE, created_at),
+            )
+
+        cur = await conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM invoice_lesson_days WHERE invoice_id = ?",
+            (invoice_id,),
+        )
+        amount = int((await cur.fetchone())[0])
+        cur = await conn.execute(
+            "SELECT discount FROM invoices WHERE id = ?", (invoice_id,)
+        )
+        discount = int((await cur.fetchone())[0])
+        cur = await conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = ?", (invoice_id,)
+        )
+        paid_total = int((await cur.fetchone())[0])
+        status = "paid" if paid_total >= amount - discount else "unpaid"
+        await conn.execute(
+            "UPDATE invoices SET amount = ?, status = ? WHERE id = ?",
+            (amount, status, invoice_id),
+        )
+        return not bool(existing_invoice)
+
+    async def _ensure_student_billing(
+        self,
+        conn: aiosqlite.Connection,
+        student_id: int,
+        effective_from: date,
+        created_by: int = 0,
+    ) -> bool:
+        cur = await conn.execute(
+            "SELECT weekday FROM schedules WHERE student_id = ? ORDER BY weekday",
+            (student_id,),
+        )
+        weekdays = {int(row[0]) for row in await cur.fetchall()}
+        if not weekdays:
+            return False
+
+        cur = await conn.execute(
+            "SELECT id, effective_from FROM billing_plans WHERE student_id = ? "
+            "AND effective_from <= ? ORDER BY effective_from DESC, id DESC LIMIT 1",
+            (student_id, effective_from.isoformat()),
+        )
+        plan = await cur.fetchone()
+        days_per_week = len(weekdays)
+        monthly_amount = days_per_week * 4 * LESSON_RATE
+        if plan is None:
+            await conn.execute(
+                "INSERT INTO billing_plans "
+                "(student_id, days_per_week, monthly_amount, effective_from, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (student_id, days_per_week, monthly_amount, effective_from.isoformat(), created_by,
+                 now_tz().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            plan_start = effective_from
+        else:
+            plan_start = date.fromisoformat(plan["effective_from"])
+
+        period = effective_from.strftime("%Y-%m")
+        return await self._ensure_attendance_invoice(conn, student_id, period, plan_start, weekdays)
+
+    async def ensure_monthly_billing(self, period: Optional[str] = None) -> Dict[str, int]:
+        """Ensure active students have the current period's automatic lesson invoice."""
+        today = now_tz().date()
+        period = period or today.strftime("%Y-%m")
+        period_start, period_end = self._billing_period_dates(period)
+        created = 0
+        skipped = 0
+        conn = await self.get_connection()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            cur = await conn.execute(
+                "SELECT s.id FROM students s WHERE s.is_active = 1 ORDER BY s.id"
+            )
+            for row in await cur.fetchall():
+                student_id = int(row[0])
+                cur_schedule = await conn.execute(
+                    "SELECT weekday FROM schedules WHERE student_id = ? ORDER BY weekday",
+                    (student_id,),
+                )
+                weekdays = {int(item[0]) for item in await cur_schedule.fetchall()}
+                if not weekdays:
+                    skipped += 1
+                    continue
+
+                cur_plan = await conn.execute(
+                    "SELECT effective_from FROM billing_plans WHERE student_id = ? "
+                    "AND effective_from <= ? ORDER BY effective_from DESC, id DESC LIMIT 1",
+                    (student_id, period_end.isoformat()),
+                )
+                plan = await cur_plan.fetchone()
+                if plan is None:
+                    # Older records have no enrollment timestamp; start fairly from today.
+                    effective_from = max(today, period_start)
+                    days_per_week = len(weekdays)
+                    await conn.execute(
+                        "INSERT INTO billing_plans "
+                        "(student_id, days_per_week, monthly_amount, effective_from, created_by, created_at) "
+                        "VALUES (?, ?, ?, ?, 0, ?)",
+                        (student_id, days_per_week, days_per_week * 4 * LESSON_RATE,
+                         effective_from.isoformat(), now_tz().strftime("%Y-%m-%d %H:%M:%S")),
+                    )
+                else:
+                    effective_from = date.fromisoformat(plan["effective_from"])
+
+                if await self._ensure_attendance_invoice(
+                    conn, student_id, period, effective_from, weekdays
+                ):
+                    created += 1
+            await conn.commit()
+            return {"created": created, "skipped": skipped}
+        except BaseException:
+            await conn.rollback()
+            raise
         finally:
             await conn.close()
 
@@ -479,6 +695,7 @@ class Database:
         self,
         student_fields: Dict[str, Any],
         schedules: List[Dict[str, Any]],
+        created_by: int = 0,
     ) -> int:
         """Insert a student and all schedule rows atomically."""
         full_name = student_fields["full_name"]
@@ -506,6 +723,8 @@ class Database:
                     INSERT INTO schedules (student_id, weekday, start_time, end_time)
                     VALUES (?, ?, ?, ?)
                 """, (student_id, weekday, start_time, end_time))
+
+            await self._ensure_student_billing(conn, student_id, now_tz().date(), created_by=created_by)
 
             await conn.commit()
             return student_id
@@ -643,6 +862,47 @@ class Database:
         finally:
             await conn.close()
 
+    async def get_admin_students(self) -> List[Dict[str, Any]]:
+        """Return active students with their schedules and effective driver for admin panels."""
+        conn = await self.get_connection()
+        try:
+            cur = await conn.execute("""
+                SELECT s.id, s.full_name, s.parent_phone_1, s.parent_phone_2, s.village_id,
+                       s.driver_id AS explicit_driver_id,
+                       COALESCE(explicit_driver.id, village_driver.id) AS assigned_driver_id,
+                       COALESCE(explicit_driver.full_name, village_driver.full_name) AS assigned_driver_name,
+                       v.name AS village_name, z.name AS zone_name,
+                       sch.weekday, sch.start_time, sch.end_time
+                FROM students s
+                JOIN villages v ON s.village_id = v.id
+                JOIN zones z ON v.zone_id = z.id
+                LEFT JOIN drivers explicit_driver ON s.driver_id = explicit_driver.id AND explicit_driver.is_active = 1
+                LEFT JOIN drivers village_driver ON v.default_driver_id = village_driver.id AND village_driver.is_active = 1
+                LEFT JOIN schedules sch ON sch.student_id = s.id
+                WHERE s.is_active = 1
+                ORDER BY s.full_name COLLATE NOCASE, sch.weekday
+            """)
+            grouped: Dict[int, Dict[str, Any]] = {}
+            for row in await cur.fetchall():
+                item = dict(row)
+                student_id = item["id"]
+                if student_id not in grouped:
+                    grouped[student_id] = {
+                        "id": student_id, "full_name": item["full_name"],
+                        "parent_phone_1": item["parent_phone_1"], "parent_phone_2": item["parent_phone_2"],
+                        "village_id": item["village_id"], "village_name": item["village_name"],
+                        "zone_name": item["zone_name"], "explicit_driver_id": item["explicit_driver_id"],
+                        "assigned_driver_id": item["assigned_driver_id"],
+                        "assigned_driver_name": item["assigned_driver_name"], "schedules": [],
+                    }
+                if item["weekday"] is not None:
+                    grouped[student_id]["schedules"].append({
+                        "weekday": item["weekday"], "start_time": item["start_time"], "end_time": item["end_time"],
+                    })
+            return list(grouped.values())
+        finally:
+            await conn.close()
+
     async def get_student_by_id(self, student_id: int) -> Optional[Dict[str, Any]]:
         conn = await self.get_connection()
         try:
@@ -719,6 +979,7 @@ class Database:
         validate_schedule_times(start_time, end_time)
         conn = await self.get_connection()
         try:
+            await conn.execute("BEGIN IMMEDIATE")
             cur = await conn.execute("""
                 INSERT INTO schedules (student_id, weekday, start_time, end_time)
                 VALUES (?, ?, ?, ?)
@@ -732,6 +993,7 @@ class Database:
     async def get_student_schedules(self, student_id: int) -> List[Dict[str, Any]]:
         conn = await self.get_connection()
         try:
+            await conn.execute("BEGIN IMMEDIATE")
             cur = await conn.execute("""
                 SELECT * FROM schedules WHERE student_id = ? ORDER BY weekday ASC
             """, (student_id,))
@@ -757,6 +1019,18 @@ class Database:
         conn = await self.get_connection()
         try:
             cur = await conn.execute("DELETE FROM schedules WHERE student_id = ?", (student_id,))
+            await conn.commit()
+            return cur.rowcount > 0
+        finally:
+            await conn.close()
+
+    async def delete_student_schedule(self, student_id: int, weekday: int) -> bool:
+        conn = await self.get_connection()
+        try:
+            cur = await conn.execute(
+                "DELETE FROM schedules WHERE student_id = ? AND weekday = ?",
+                (student_id, weekday),
+            )
             await conn.commit()
             return cur.rowcount > 0
         finally:
@@ -2059,12 +2333,15 @@ class Database:
         finally:
             await conn.close()
 
-    async def bulk_upsert_students_and_schedules(self, parsed_data: List[Dict[str, Any]]) -> Dict[str, int]:
+    async def bulk_upsert_students_and_schedules(
+        self, parsed_data: List[Dict[str, Any]], created_by: int = 0
+    ) -> Dict[str, int]:
         """Excel orqali o'quvchilar va dars jadvallarini ommaviy saqlash/yangilash."""
         created = 0
         updated = 0
         conn = await self.get_connection()
         try:
+            await conn.execute("BEGIN IMMEDIATE")
             for item in parsed_data:
                 full_name = item["full_name"].strip()
                 norm_p1 = normalize_phone(item.get("parent_phone_1"))
@@ -2107,8 +2384,15 @@ class Database:
                         DO UPDATE SET start_time = excluded.start_time, end_time = excluded.end_time
                     """, (student_id, weekday, st_time, end_time))
 
+                await self._ensure_student_billing(
+                    conn, student_id, now_tz().date(), created_by=created_by
+                )
+
             await conn.commit()
             return {"created": created, "updated": updated}
+        except BaseException:
+            await conn.rollback()
+            raise
         finally:
             await conn.close()
 
@@ -2380,6 +2664,136 @@ class Database:
         finally:
             await conn.close()
 
+    async def get_parent_billing_summary(self, parent_id: int, period: str) -> Dict[str, Any]:
+        """Return this month's invoice and every outstanding older invoice per linked child."""
+        conn = await self.get_connection()
+        try:
+            cur = await conn.execute(
+                """
+                SELECT s.id AS student_id, s.full_name, s.is_active,
+                       i.id AS invoice_id, i.period, i.amount, i.discount, i.status, i.billing_mode,
+                       COALESCE((SELECT COUNT(*) FROM invoice_lesson_days ild WHERE ild.invoice_id = i.id), 0) AS lesson_count,
+                       COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id = i.id), 0) AS paid_total
+                FROM student_parents sp
+                JOIN students s ON s.id = sp.student_id
+                LEFT JOIN invoices i ON i.student_id = s.id
+                  AND (
+                    i.period = ?
+                    OR (i.period < ? AND i.status <> 'waived' AND
+                        i.amount - i.discount - COALESCE((
+                            SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id = i.id
+                        ), 0) > 0)
+                  )
+                WHERE sp.parent_id = ?
+                ORDER BY s.full_name COLLATE NOCASE, i.period DESC
+                """,
+                (period, period, parent_id),
+            )
+            children_by_id: Dict[int, Dict[str, Any]] = {}
+            for row in await cur.fetchall():
+                student_id = row["student_id"]
+                child = children_by_id.setdefault(student_id, {
+                    "student_id": student_id,
+                    "name": row["full_name"],
+                    "active": bool(row["is_active"]),
+                    "current_invoice": None,
+                    "overdue_invoices": [],
+                    "total_due": 0,
+                })
+                if row["invoice_id"] is None:
+                    continue
+                due = 0 if row["status"] == "waived" else max(
+                    0, row["amount"] - row["discount"] - row["paid_total"]
+                )
+                invoice = {
+                    "id": row["invoice_id"],
+                    "period": row["period"],
+                    "amount": row["amount"],
+                    "discount": row["discount"],
+                    "paid_total": row["paid_total"],
+                    "billing_mode": row["billing_mode"],
+                    "lesson_count": row["lesson_count"],
+                    "lesson_rate": LESSON_RATE if row["billing_mode"] == "attendance" else None,
+                    "due": due,
+                    "status": row["status"],
+                }
+                if row["period"] == period:
+                    child["current_invoice"] = invoice
+                elif due > 0:
+                    child["overdue_invoices"].append(invoice)
+                child["total_due"] += due
+
+            children = list(children_by_id.values())
+            return {
+                "period": period,
+                "due_day": 10,
+                "total_due": sum(child["total_due"] for child in children),
+                "children": children,
+            }
+        finally:
+            await conn.close()
+
+    async def get_billing_reminder_candidates(self, period: str) -> List[Dict[str, Any]]:
+        """Return linked parents and student invoices with a positive outstanding balance."""
+        conn = await self.get_connection()
+        try:
+            cur = await conn.execute(
+                """
+                SELECT p.id AS parent_id, p.telegram_id,
+                       s.id AS student_id, s.full_name AS student_name,
+                       i.id AS invoice_id, i.period, i.amount, i.discount, i.status,
+                       COALESCE(SUM(pay.amount), 0) AS paid_total
+                FROM parents p
+                JOIN student_parents sp ON sp.parent_id = p.id
+                JOIN students s ON s.id = sp.student_id
+                JOIN invoices i ON i.student_id = s.id
+                LEFT JOIN payments pay ON pay.invoice_id = i.id
+                WHERE i.period <= ? AND i.status <> 'waived'
+                GROUP BY p.id, p.telegram_id, s.id, s.full_name,
+                         i.id, i.period, i.amount, i.discount, i.status
+                HAVING i.amount - i.discount - COALESCE(SUM(pay.amount), 0) > 0
+                ORDER BY p.id, s.full_name COLLATE NOCASE, i.period DESC
+                """,
+                (period,),
+            )
+            return [dict(row) for row in await cur.fetchall()]
+        finally:
+            await conn.close()
+
+    async def claim_billing_reminder(self, parent_id: int, period: str, reminder_day: int) -> bool:
+        """Claim one reminder slot so a scheduler restart cannot send it twice."""
+        conn = await self.get_connection()
+        try:
+            cur = await conn.execute(
+                """
+                INSERT OR IGNORE INTO billing_reminder_log
+                    (parent_id, period, reminder_day, attempted_at, status)
+                VALUES (?, ?, ?, ?, 'pending')
+                """,
+                (parent_id, period, reminder_day, now_tz().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            await conn.commit()
+            return cur.rowcount == 1
+        finally:
+            await conn.close()
+
+    async def update_billing_reminder_status(
+        self, parent_id: int, period: str, reminder_day: int, status: str
+    ) -> bool:
+        conn = await self.get_connection()
+        try:
+            cur = await conn.execute(
+                """
+                UPDATE billing_reminder_log SET status = ?
+                WHERE parent_id = ? AND period = ? AND reminder_day = ?
+                """,
+                (status, parent_id, period, reminder_day),
+            )
+            await conn.commit()
+            return cur.rowcount == 1
+        finally:
+            await conn.close()
+
     async def create_invoice_if_missing(self, student_id: int, period: str, amount: int) -> bool:
         """Create one monthly invoice; return False when that student/month exists."""
         if type(amount) is not int or amount < 0:
@@ -2502,7 +2916,7 @@ class Database:
         conn = await self.get_connection()
         try:
             cur = await conn.execute(
-                "SELECT id, amount, discount, status FROM invoices WHERE student_id = ? AND period = ?",
+                "SELECT id, amount, discount, status, billing_mode FROM invoices WHERE student_id = ? AND period = ?",
                 (student_id, period),
             )
             invoice = await cur.fetchone()
@@ -2512,11 +2926,18 @@ class Database:
                 "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = ?", (invoice["id"],)
             )
             paid_total = (await cur.fetchone())[0]
+            cur = await conn.execute(
+                "SELECT COUNT(*) FROM invoice_lesson_days WHERE invoice_id = ?", (invoice["id"],)
+            )
+            lesson_count = int((await cur.fetchone())[0])
             return {
                 "id": invoice["id"],
                 "amount": invoice["amount"],
                 "discount": invoice["discount"],
                 "paid_total": paid_total,
+                "billing_mode": invoice["billing_mode"],
+                "lesson_count": lesson_count,
+                "lesson_rate": LESSON_RATE if invoice["billing_mode"] == "attendance" else None,
                 "due": invoice["amount"] - invoice["discount"] - paid_total,
                 "status": invoice["status"],
             }
@@ -2530,7 +2951,8 @@ class Database:
             cur = await conn.execute(
                 """
                 SELECT s.id, s.full_name, COUNT(DISTINCT sch.weekday) AS days_per_week,
-                       i.id AS invoice_id, i.amount, i.discount, i.status,
+                       i.id AS invoice_id, i.amount, i.discount, i.status, i.billing_mode,
+                       COALESCE((SELECT COUNT(*) FROM invoice_lesson_days ild WHERE ild.invoice_id = i.id), 0) AS lesson_count,
                        COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id = i.id), 0) AS paid_total
                 FROM students s
                 LEFT JOIN schedules sch ON sch.student_id = s.id
@@ -2544,9 +2966,10 @@ class Database:
             rows = [dict(row) for row in await cur.fetchall()]
             for row in rows:
                 if row["invoice_id"] is None:
-                    row.update({"paid_total": 0, "due": None})
+                    row.update({"paid_total": 0, "due": None, "lesson_rate": None})
                 else:
                     row["due"] = row["amount"] - row["discount"] - row["paid_total"]
+                    row["lesson_rate"] = LESSON_RATE if row["billing_mode"] == "attendance" else None
             return rows
         finally:
             await conn.close()
