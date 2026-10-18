@@ -66,6 +66,12 @@ class DriverPickupVillageCallback(CallbackData, prefix="driver_pickup_village"):
     village_id: int
 
 
+class DriverRouteProgressCallback(CallbackData, prefix="driver_route"):
+    action: Literal["start", "arrive", "leave"]
+    trip_id: int
+    village_id: int
+
+
 class DriverDropoffVillageCallback(CallbackData, prefix="driver_dropoff_village"):
     trip_id: int
     village_id: int

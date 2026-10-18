@@ -206,6 +206,18 @@ class Database:
                 actor_id INTEGER
             );
 
+            -- Haydovchining har bir mahalladagi bosqichlari (yo'lda, yetib keldi, olib ketdi)
+            CREATE TABLE IF NOT EXISTS trip_stop_progress (
+                trip_id INTEGER NOT NULL REFERENCES trips(id) ON DELETE CASCADE,
+                village_id INTEGER NOT NULL REFERENCES villages(id) ON DELETE RESTRICT,
+                status TEXT NOT NULL DEFAULT 'planned'
+                    CHECK (status IN ('planned', 'en_route', 'arrived', 'left')),
+                started_at TEXT,
+                arrived_at TEXT,
+                left_at TEXT,
+                PRIMARY KEY (trip_id, village_id)
+            );
+
             -- 12. Audit log
             CREATE TABLE IF NOT EXISTS event_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1331,7 +1343,132 @@ class Database:
                 ORDER BY CASE WHEN ? = 'to_center' THEN v.route_order ELSE -v.route_order END ASC
             """, (trip_id, trip["direction"]))
             trip["items"] = [dict(r) for r in await cur_items.fetchall()]
+            cur_stops = await conn.execute("""
+                SELECT v.id AS village_id, v.name AS village_name, v.route_order,
+                       COALESCE(p.status, 'planned') AS status,
+                       SUM(CASE WHEN ti.status != 'absent' THEN 1 ELSE 0 END) AS student_count,
+                       SUM(CASE WHEN ti.status = 'pending' THEN 1 ELSE 0 END) AS pending_count
+                FROM trip_items ti
+                JOIN villages v ON v.id = ti.village_id
+                LEFT JOIN trip_stop_progress p
+                  ON p.trip_id = ti.trip_id AND p.village_id = ti.village_id
+                WHERE ti.trip_id = ? AND ti.status != 'absent'
+                GROUP BY v.id, v.name, v.route_order, p.status
+                ORDER BY v.route_order ASC, v.id ASC
+            """, (trip_id,))
+            trip["route_stops"] = [dict(r) for r in await cur_stops.fetchall()]
             return trip
+        finally:
+            await conn.close()
+
+    async def transition_trip_stop(
+        self, trip_id: int, village_id: int, driver_id: int,
+        expected_status: str, new_status: str, changed_at: str,
+    ) -> bool:
+        """Atomically advance one pickup stop and, on the first stop, start the trip."""
+        allowed = {
+            ("planned", "en_route"),
+            ("en_route", "arrived"),
+            ("arrived", "left"),
+        }
+        if (expected_status, new_status) not in allowed:
+            return False
+        conn = await self.get_connection()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            cur_trip = await conn.execute(
+                "SELECT driver_id, direction, status FROM trips WHERE id = ?",
+                (trip_id,),
+            )
+            trip = await cur_trip.fetchone()
+            if (not trip or trip["driver_id"] != driver_id
+                    or trip["direction"] != "to_center"
+                    or trip["status"] not in ("planned", "approved", "on_way")):
+                await conn.rollback()
+                return False
+
+            cur_stop = await conn.execute("""
+                SELECT v.route_order,
+                       EXISTS(
+                           SELECT 1 FROM trip_items ti
+                           WHERE ti.trip_id = ? AND ti.village_id = ? AND ti.status != 'absent'
+                       ) AS has_students
+                FROM villages v WHERE v.id = ?
+            """, (trip_id, village_id, village_id))
+            stop = await cur_stop.fetchone()
+            if not stop or not stop["has_students"]:
+                await conn.rollback()
+                return False
+
+            await conn.execute("""
+                INSERT OR IGNORE INTO trip_stop_progress (trip_id, village_id, status)
+                VALUES (?, ?, 'planned')
+            """, (trip_id, village_id))
+
+            if expected_status == "planned":
+                cur_prior = await conn.execute("""
+                    SELECT 1
+                    FROM trip_items ti
+                    JOIN villages v ON v.id = ti.village_id
+                    LEFT JOIN trip_stop_progress p
+                      ON p.trip_id = ti.trip_id AND p.village_id = ti.village_id
+                    WHERE ti.trip_id = ? AND ti.status != 'absent'
+                      AND v.route_order < ? AND COALESCE(p.status, 'planned') != 'left'
+                    LIMIT 1
+                """, (trip_id, stop["route_order"]))
+                if await cur_prior.fetchone():
+                    await conn.rollback()
+                    return False
+
+            if expected_status == "arrived":
+                cur_pending = await conn.execute("""
+                    SELECT 1 FROM trip_items
+                    WHERE trip_id = ? AND village_id = ? AND status = 'pending'
+                    LIMIT 1
+                """, (trip_id, village_id))
+                if await cur_pending.fetchone():
+                    await conn.rollback()
+                    return False
+
+            if expected_status == "planned" and trip["status"] != "on_way":
+                cur_start = await conn.execute("""
+                    UPDATE trips SET status = 'on_way', started_at = coalesce(started_at, ?)
+                    WHERE id = ? AND status IN ('planned', 'approved')
+                """, (changed_at, trip_id))
+                if cur_start.rowcount != 1:
+                    await conn.rollback()
+                    return False
+
+            timestamp_column = {
+                "en_route": "started_at", "arrived": "arrived_at", "left": "left_at",
+            }[new_status]
+            cur_update = await conn.execute(f"""
+                UPDATE trip_stop_progress
+                SET status = ?, {timestamp_column} = ?
+                WHERE trip_id = ? AND village_id = ? AND status = ?
+            """, (new_status, changed_at, trip_id, village_id, expected_status))
+            if cur_update.rowcount != 1:
+                await conn.rollback()
+                return False
+
+            action = {
+                "en_route": "driver_depart_village",
+                "arrived": "driver_arrive_village",
+                "left": "driver_leave_village",
+            }[new_status]
+            cur_driver = await conn.execute(
+                "SELECT telegram_id FROM drivers WHERE id = ?", (driver_id,)
+            )
+            driver_row = await cur_driver.fetchone()
+            await conn.execute(
+                "INSERT INTO event_log (ts, actor_role, actor_id, action, trip_id) VALUES (?, 'driver', ?, ?, ?)",
+                (changed_at, driver_row["telegram_id"] if driver_row else driver_id, action, trip_id),
+            )
+            await conn.commit()
+            return True
+        except BaseException:
+            await conn.rollback()
+            raise
         finally:
             await conn.close()
 

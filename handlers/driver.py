@@ -5,8 +5,8 @@ import tempfile
 from datetime import datetime
 from aiogram import Router, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
 from config import settings
 from database.db import Database
@@ -15,15 +15,41 @@ from models.callbacks import (
     DriverAlertCallback, DriverAlreadyDoneCallback, DriverArriveCenterCallback, DriverDropoffCallback,
     DriverDropoffVillageCallback, DriverFinishTripCallback, DriverPickupCallback,
     DriverPickupVillageCallback, DriverRefreshTripCallback, DriverStartTripCallback,
+    DriverRouteProgressCallback,
 )
 from services.notify_service import NotifyService
 from services.driver_route_pdf import build_driver_daily_pdf
+from services.driver_route_controls import build_driver_trip_keyboard, format_trip_card_text
 from services.telegram_safe import safe_send, safe_send_document
 from utils.text import escape_html
 from utils.telegram import safe_refresh_edit
 
 logger = logging.getLogger(__name__)
 driver_router = Router()
+
+
+async def _notify_village_parents(db: Database, bot, trip: dict, village_id: int, arrived: bool) -> None:
+    items = [
+        item for item in trip.get("items", [])
+        if int(item.get("village_id", -1)) == village_id
+        and item.get("status") != TripItemStatus.ABSENT.value
+    ]
+    village_name = escape_html(items[0].get("village_name", "mahalla")) if items else "mahalla"
+    for item in items:
+        student_name = escape_html(item.get("full_name", "Farzandingiz"))
+        if arrived:
+            text = (
+                f"📍 Haydovchi <b>{student_name}</b> uchun {village_name} mahallasiga yetib keldi. "
+                "Iltimos, farzandingizni yuborishga tayyorlang."
+            )
+        else:
+            text = (
+                f"🚗 Haydovchi <b>{student_name}</b>ni darsga olib ketgani "
+                f"{village_name} mahallasiga yo'lga chiqdi. Farzandingizni tayyorlab qo'ying."
+            )
+        await NotifyService.send_student_notification(
+            db=db, student_id=int(item["student_id"]), text=text, bot=bot,
+        )
 
 def get_driver_menu_kb() -> ReplyKeyboardMarkup:
     """Haydovchi uchun doimiy pastki Reply klaviatura."""
@@ -34,137 +60,6 @@ def get_driver_menu_kb() -> ReplyKeyboardMarkup:
         KeyboardButton(text="📞 Markaz / Admin")
     )
     return builder.as_markup(resize_keyboard=True)
-
-def build_driver_trip_keyboard(trip: dict) -> InlineKeyboardMarkup:
-    rows = []
-    trip_id = trip["id"]
-    direction = trip["direction"]
-    status = trip["status"]
-    items = trip.get("items", [])
-
-    if direction == TripDirection.TO_CENTER.value:
-        if status in [TripStatus.PLANNED.value, TripStatus.APPROVED.value]:
-            rows.append([InlineKeyboardButton(text="🚗 Yo'ldaman", callback_data=DriverStartTripCallback(trip_id=trip_id).pack())])
-        elif status == TripStatus.ON_WAY.value:
-            # Bir mahallada 1 dan ortiq olinmagan bola bo'lsa "Hammasini oldim" tugmasi
-            pending_per_village = {}
-            village_names = {}
-            for it in items:
-                if it["status"] == TripItemStatus.PENDING.value:
-                    vid = it["village_id"]
-                    pending_per_village[vid] = pending_per_village.get(vid, 0) + 1
-                    village_names[vid] = it.get("village_name", f"Mahalla {vid}")
-
-            added_village_batch_btn = set()
-
-            for it in items:
-                vid = it["village_id"]
-                if pending_per_village.get(vid, 0) > 1 and vid not in added_village_batch_btn:
-                    rows.append([InlineKeyboardButton(
-                        text=f"✅ {village_names[vid]}: Hammasini oldim",
-                        callback_data=DriverPickupVillageCallback(trip_id=trip_id, village_id=vid).pack()
-                    )])
-                    added_village_batch_btn.add(vid)
-
-                it_st = it["status"]
-                if it_st == TripItemStatus.PENDING.value:
-                    btn_text = f"⏳ {it['full_name']} ({it['village_name']}) — Oldim"
-                    cb_data = DriverPickupCallback(trip_id=trip_id, item_id=it["id"]).pack()
-                elif it_st == TripItemStatus.PICKED_UP.value:
-                    btn_text = f"✅ {it['full_name']} (Olindi)"
-                    cb_data = DriverAlreadyDoneCallback(item_id=it["id"]).pack()
-                elif it_st == TripItemStatus.ABSENT.value:
-                    btn_text = f"🚫 {it['full_name']} (Kelmaydi)"
-                    cb_data = "driver_noop"
-                else:
-                    btn_text = f"ℹ️ {it['full_name']} ({it_st})"
-                    cb_data = "driver_noop"
-                rows.append([InlineKeyboardButton(text=btn_text, callback_data=cb_data)])
-
-            # Agar barcha bolalar olingan bo'lsa (yoki absent bo'lsa) markazga yetib keldim tugmasi
-            all_collected = all(it["status"] in [TripItemStatus.PICKED_UP.value, TripItemStatus.ABSENT.value] for it in items)
-            if all_collected:
-                rows.append([InlineKeyboardButton(text="🏁 Yetib keldim", callback_data=DriverArriveCenterCallback(trip_id=trip_id).pack())])
-
-    elif direction == TripDirection.TO_HOME.value:
-        if status in [TripStatus.PLANNED.value, TripStatus.APPROVED.value, TripStatus.HANDED_OVER.value]:
-            rows.append([InlineKeyboardButton(text="🚗 Yo'lga chiqdim", callback_data=DriverStartTripCallback(trip_id=trip_id).pack())])
-        elif status == TripStatus.ON_WAY.value:
-            # Bir mahallada 1 dan ortiq yetkazilmagan bola bo'lsa "Hammasini yetkazdim" tugmasi
-            undropped_per_village = {}
-            village_names = {}
-            for it in items:
-                if it["status"] not in [TripItemStatus.DROPPED_OFF.value, TripItemStatus.ABSENT.value]:
-                    vid = it["village_id"]
-                    undropped_per_village[vid] = undropped_per_village.get(vid, 0) + 1
-                    village_names[vid] = it.get("village_name", f"Mahalla {vid}")
-
-            added_village_dropoff_btn = set()
-
-            for it in items:
-                vid = it["village_id"]
-                if undropped_per_village.get(vid, 0) > 1 and vid not in added_village_dropoff_btn:
-                    rows.append([InlineKeyboardButton(
-                        text=f"✅ {village_names[vid]}: Hammasini yetkazdim",
-                        callback_data=DriverDropoffVillageCallback(trip_id=trip_id, village_id=vid).pack()
-                    )])
-                    added_village_dropoff_btn.add(vid)
-
-                it_st = it["status"]
-                if it_st in [TripItemStatus.PENDING.value, TripItemStatus.HANDED_OVER.value, TripItemStatus.ARRIVED.value, TripItemStatus.ACCEPTED.value]:
-                    btn_text = f"⏳ {it['full_name']} ({it['village_name']}) — Yetkazdim"
-                    cb_data = DriverDropoffCallback(trip_id=trip_id, item_id=it["id"]).pack()
-                elif it_st == TripItemStatus.DROPPED_OFF.value:
-                    btn_text = f"✅ {it['full_name']} (Yetkazildi)"
-                    cb_data = DriverAlreadyDoneCallback(item_id=it["id"]).pack()
-                elif it_st == TripItemStatus.ABSENT.value:
-                    btn_text = f"🚫 {it['full_name']} (Kelmaydi)"
-                    cb_data = "driver_noop"
-                else:
-                    btn_text = f"ℹ️ {it['full_name']} ({it_st})"
-                    cb_data = "driver_noop"
-                rows.append([InlineKeyboardButton(text=btn_text, callback_data=cb_data)])
-
-            # Hamma bolalar yetkazilgan bo'lsa reysni yakunlash
-            all_dropped = all(it["status"] in [TripItemStatus.DROPPED_OFF.value, TripItemStatus.ABSENT.value] for it in items)
-            if all_dropped:
-                rows.append([InlineKeyboardButton(text="🏁 Reysni yakunlash", callback_data=DriverFinishTripCallback(trip_id=trip_id).pack())])
-
-    rows.append([InlineKeyboardButton(text="🔄 Yangilash", callback_data=DriverRefreshTripCallback(trip_id=trip_id).pack())])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def format_trip_card_text(trip: dict) -> str:
-    dir_label = "🚖 Markazga kelish (to_center)" if trip["direction"] == TripDirection.TO_CENTER.value else "🏠 Uyga qaytish (to_home)"
-    status_dict = {
-        TripStatus.PLANNED.value: "Rejalashtirilgan ⏳",
-        TripStatus.APPROVED.value: "Tasdiqlangan ✅",
-        TripStatus.ON_WAY.value: "Yo'lda 🚗",
-        TripStatus.AT_CENTER.value: "Markazga yetib kelgan 🏁",
-        TripStatus.HANDED_OVER.value: "Bolalar topshirilgan 🤝",
-        TripStatus.DONE.value: "Yakunlangan 🎉",
-        TripStatus.CANCELLED.value: "Bekor qilingan ❌"
-    }
-    status_label = escape_html(status_dict.get(trip["status"], trip["status"]))
-
-    text = (
-        f"📋 <b>Reys #{trip['id']} — {dir_label}</b>\n"
-        f"⏰ Reja vaqti: <b>{escape_html(trip['planned_time'])}</b>\n"
-        f"🚦 Holati: <b>{status_label}</b>\n\n"
-        f"<b>O'quvchilar ro'yxati ({len(trip.get('items', []))} ta):</b>\n"
-    )
-
-    for idx, it in enumerate(trip.get("items", []), start=1):
-        st_ico = "⏳"
-        if it["status"] == TripItemStatus.PICKED_UP.value:
-            st_ico = "✅ Olingan"
-        elif it["status"] == TripItemStatus.DROPPED_OFF.value:
-            st_ico = "🏠 Yetkazilgan"
-        elif it["status"] == TripItemStatus.ABSENT.value:
-            st_ico = "🚫 Kelmaydi"
-        pickup = f" ({escape_html(it['pickup_point'])})" if it.get("pickup_point") else ""
-        text += f"  {idx}. <b>{escape_html(it['full_name'])}</b> — {escape_html(it['village_name'])}{pickup} [{st_ico}]\n"
-
-    return text
 
 # --- 1. /mening_reyslarim, /bugun va Reply tugma ---
 @driver_router.message(Command("mening_reyslarim"))
@@ -345,6 +240,59 @@ async def cb_driver_alert(callback: types.CallbackQuery, db: Database, callback_
     )
     await callback.answer("Xabar yuborildi!", show_alert=True)
 
+@driver_router.callback_query(DriverRouteProgressCallback.filter())
+async def cb_driver_route_progress(
+    callback: types.CallbackQuery,
+    db: Database,
+    callback_data: DriverRouteProgressCallback | None = None,
+):
+    driver = await db.get_driver_by_tg_id(callback.from_user.id)
+    if not driver:
+        await callback.answer("Bu tugma faqat faol haydovchi uchun.", show_alert=True)
+        return
+
+    parsed = callback_data or DriverRouteProgressCallback.unpack(callback.data)
+    trip = await db.get_trip_details(parsed.trip_id)
+    if not trip or trip.get("driver_id") != driver["id"]:
+        await callback.answer("Bu sizga biriktirilgan reys emas.", show_alert=True)
+        return
+    if trip.get("direction") != TripDirection.TO_CENTER.value:
+        await callback.answer("Bu tugma markazga olib kelish reysi uchun.", show_alert=True)
+        return
+
+    transitions = {
+        "start": ("planned", "en_route"),
+        "arrive": ("en_route", "arrived"),
+        "leave": ("arrived", "left"),
+    }
+    expected_status, new_status = transitions[parsed.action]
+    changed_at = now_tz().strftime("%Y-%m-%d %H:%M:%S")
+    changed = await db.transition_trip_stop(
+        parsed.trip_id, parsed.village_id, driver["id"],
+        expected_status, new_status, changed_at,
+    )
+    if not changed:
+        message = {
+            "start": "Avvalgi mahalla yakunlanmagan yoki bu to'xtash allaqachon boshlangan.",
+            "arrive": "Avval mahalla tomon yo'lga chiqing yoki tugmani yangilang.",
+            "leave": "Barcha bolalarni alohida belgilang, keyin yo'lga chiqing.",
+        }[parsed.action]
+        await callback.answer(message, show_alert=True)
+        return
+
+    updated_trip = await db.get_trip_details(parsed.trip_id)
+    if parsed.action in ("start", "arrive"):
+        await _notify_village_parents(
+            db, callback.bot, updated_trip, parsed.village_id,
+            arrived=parsed.action == "arrive",
+        )
+    await safe_refresh_edit(
+        callback,
+        format_trip_card_text(updated_trip),
+        build_driver_trip_keyboard(updated_trip),
+    )
+
+
 # --- 2. Yo'lga chiqdim ([🚗 Yo'ldaman] / [🚗 Yo'lga chiqdim]) ---
 @driver_router.callback_query(DriverStartTripCallback.filter())
 async def cb_driver_start_trip(callback: types.CallbackQuery, db: Database, callback_data: DriverStartTripCallback | None = None):
@@ -364,14 +312,35 @@ async def cb_driver_start_trip(callback: types.CallbackQuery, db: Database, call
         await callback.answer("Bu sizning reysingiz emas!", show_alert=True)
         return
 
-    if trip["status"] == TripStatus.ON_WAY.value:
-        await callback.answer("Reys allaqachon yo'lda!", show_alert=True)
-        return
-
     now_str = now_tz().strftime("%Y-%m-%d %H:%M:%S")
     if trip["direction"] == TripDirection.TO_CENTER.value:
-        allowed_statuses = [TripStatus.PLANNED.value, TripStatus.APPROVED.value]
+        first_stop = next(
+            (stop for stop in trip.get("route_stops", []) if stop.get("status") != "left"),
+            None,
+        )
+        if not first_stop or first_stop.get("status") != "planned":
+            await callback.answer("Reys allaqachon boshlangan yoki holati o'zgargan.", show_alert=True)
+            return
+        claimed = await db.transition_trip_stop(
+            trip_id, int(first_stop["village_id"]), driver["id"],
+            "planned", "en_route", now_str,
+        )
+        if not claimed:
+            await callback.answer("Reys holati o'zgargan, yangilang!", show_alert=True)
+            return
+        updated_trip = await db.get_trip_details(trip_id)
+        await _notify_village_parents(
+            db, callback.bot, updated_trip, int(first_stop["village_id"]), arrived=False,
+        )
+        await safe_refresh_edit(
+            callback, format_trip_card_text(updated_trip),
+            build_driver_trip_keyboard(updated_trip),
+        )
+        return
     elif trip["direction"] == TripDirection.TO_HOME.value:
+        if trip["status"] == TripStatus.ON_WAY.value:
+            await callback.answer("Reys allaqachon yo'lda!", show_alert=True)
+            return
         allowed_statuses = [TripStatus.PLANNED.value, TripStatus.APPROVED.value]
         allowed_statuses.append(TripStatus.HANDED_OVER.value)
     else:
@@ -440,6 +409,13 @@ async def cb_driver_pickup(callback: types.CallbackQuery, db: Database, callback
 
     if item["trip_id"] != trip_id:
         await callback.answer("O'quvchi ushbu reysga tegishli emas!", show_alert=True)
+        return
+    stop = next(
+        (row for row in trip.get("route_stops", []) if int(row["village_id"]) == int(item["village_id"])),
+        None,
+    )
+    if not stop or stop.get("status") != "arrived":
+        await callback.answer("Avval shu mahallaga yetib kelganingizni belgilang.", show_alert=True)
         return
     if item["status"] == TripItemStatus.PICKED_UP.value:
         await callback.answer("Ushbu bola allaqachon olingan!", show_alert=True)
@@ -677,55 +653,13 @@ async def cb_driver_already_done(callback: types.CallbackQuery, callback_data: D
 async def cb_driver_noop(callback: types.CallbackQuery):
     await callback.answer()
 
-# --- 8. Bir mahalladagi barcha bolalarni birdaniga olish (to_center) ---
+# --- Eski ommaviy olish tugmalari ---
 @driver_router.callback_query(DriverPickupVillageCallback.filter())
 async def cb_driver_pickup_village(callback: types.CallbackQuery, db: Database, callback_data: DriverPickupVillageCallback | None = None):
-    driver = await db.get_driver_by_tg_id(callback.from_user.id)
-    if not driver:
-        await callback.answer("Faqat faol haydovchilar uchun!", show_alert=True)
-        return
-
-    parsed = callback_data or DriverPickupVillageCallback.unpack(callback.data)
-    trip_id, village_id = parsed.trip_id, parsed.village_id
-
-    trip = await db.get_trip_details(trip_id)
-    if not trip:
-        await callback.answer("Reys topilmadi!", show_alert=True)
-        return
-
-    # Begona haydovchi tekshiruvi
-    if trip["driver_id"] != driver["id"]:
-        await callback.answer("Bu sizning reysingiz emas!", show_alert=True)
-        return
-
-    if trip["direction"] != TripDirection.TO_CENTER.value:
-        await callback.answer("Bu markazga kelish reysi emas!", show_alert=True)
-        return
-    if trip["status"] != TripStatus.ON_WAY.value:
-        await callback.answer("Reys hali yo'lga chiqmagan yoki holati o'zgargan!", show_alert=True)
-        return
-
-    picked_items = await db.pickup_village_students(trip_id, village_id, driver["id"])
-    if not picked_items:
-        await callback.answer("Ushbu mahalladagi barcha bolalar allaqachon olingan!", show_alert=True)
-        return
-
-    # Har bir bolaning ota-onasiga alohida xabarnoma yuborish
-    v_name = picked_items[0].get("village_name", "")
-    for item in picked_items:
-        notify_text = f"Farzandingiz mashinaga o'tirdi. Taxminan {item.get('travel_minutes', 15)} daqiqada markazga yetadi."
-        await NotifyService.send_student_notification(
-            db=db,
-            student_id=item["student_id"],
-            text=notify_text,
-            bot=callback.bot
-        )
-
-    updated_trip = await db.get_trip_details(trip_id)
-    card_text = format_trip_card_text(updated_trip)
-    kb = build_driver_trip_keyboard(updated_trip)
-    await callback.message.edit_text(card_text, reply_markup=kb, parse_mode="HTML")
-    await callback.answer(f"{v_name}: {len(picked_items)} ta o'quvchi olindi!")
+    await callback.answer(
+        "Har bir o'quvchini alohida 'mashinaga mindi' tugmasi bilan belgilang.",
+        show_alert=True,
+    )
 
 # --- 9. Bir mahalladagi barcha bolalarni birdaniga yetkazish (to_home) ---
 @driver_router.callback_query(DriverDropoffVillageCallback.filter())

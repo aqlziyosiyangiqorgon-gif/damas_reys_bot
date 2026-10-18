@@ -88,34 +88,38 @@ def _date_time(value: str) -> str:
 
 
 class PaymentStamp(Flowable):
-    """A decorative center payment stamp, clearly marked as a receipt mark."""
+    """A square-paper receipt seal with a double circular payment mark."""
 
     def __init__(self, receipt_number: str):
         super().__init__()
         self.receipt_number = receipt_number
-        self.width = 4.3 * cm
-        self.height = 2.35 * cm
+        self.width = 3.65 * cm
+        self.height = 3.45 * cm
 
     def draw(self) -> None:
         canvas = self.canv
         canvas.saveState()
         canvas.translate(self.width / 2, self.height / 2)
-        canvas.rotate(-7)
-        canvas.setStrokeColor(GOLD)
-        canvas.setLineWidth(1.8)
-        canvas.ellipse(-2.05 * cm, -0.9 * cm, 2.05 * cm, 0.9 * cm, stroke=1, fill=0)
         canvas.setStrokeColor(NAVY)
-        canvas.setLineWidth(0.7)
-        canvas.ellipse(-1.9 * cm, -0.75 * cm, 1.9 * cm, 0.75 * cm, stroke=1, fill=0)
+        canvas.setLineWidth(1.2)
+        canvas.circle(0, 0, 1.48 * cm, stroke=1, fill=0)
+        canvas.setStrokeColor(GOLD)
+        canvas.setLineWidth(0.8)
+        canvas.circle(0, 0, 1.34 * cm, stroke=1, fill=0)
+        canvas.setStrokeColor(NAVY)
+        canvas.setLineWidth(0.55)
+        canvas.circle(0, 0, 1.22 * cm, stroke=1, fill=0)
         canvas.setFillColor(NAVY)
-        canvas.setFont(FONT_BOLD, 7.1)
-        canvas.drawCentredString(0, 0.28 * cm, "AQL ZIYOSI")
+        canvas.setFont(FONT_BOLD, 7.0)
+        canvas.drawCentredString(0, 0.52 * cm, "AQL ZIYOSI")
         canvas.setFillColor(GREEN)
-        canvas.setFont(FONT_BOLD, 6.2)
-        canvas.drawCentredString(0, -0.05 * cm, "TO'LOV QABUL QILINDI")
+        canvas.setFont(FONT_BOLD, 5.5)
+        canvas.drawCentredString(0, 0.06 * cm, "TO'LOV QABUL QILINDI")
         canvas.setFillColor(NAVY)
-        canvas.setFont(FONT, 5.5)
-        canvas.drawCentredString(0, -0.38 * cm, self.receipt_number)
+        canvas.setFont(FONT, 5.4)
+        canvas.drawCentredString(0, -0.38 * cm, "ELEKTRON CHEK")
+        canvas.setFont(FONT, 5.0)
+        canvas.drawCentredString(0, -0.72 * cm, self.receipt_number)
         canvas.restoreState()
 
 
@@ -126,22 +130,22 @@ def build_payment_receipt_pdf(data: dict[str, Any]) -> bytes:
     output = BytesIO()
     doc = SimpleDocTemplate(
         output, pagesize=A5, rightMargin=1.35 * cm, leftMargin=1.35 * cm,
-        topMargin=1.0 * cm, bottomMargin=1.0 * cm,
+        topMargin=1.15 * cm, bottomMargin=1.2 * cm,
         title=f"AQL ZIYOSI payment receipt {data['payment_id']}",
         author="AQL ZIYOSI o'quv markazi",
     )
     base = getSampleStyleSheet()
     title_style = ParagraphStyle(
-        "AZReceiptTitle", parent=base["Title"], fontName=FONT_BOLD, fontSize=15,
-        leading=19, textColor=NAVY, alignment=TA_CENTER, spaceAfter=2,
+        "AZReceiptTitle", parent=base["Title"], fontName=FONT_BOLD, fontSize=17,
+        leading=20, textColor=NAVY, alignment=TA_CENTER, spaceAfter=3,
     )
     subtitle_style = ParagraphStyle(
         "AZReceiptSubtitle", parent=base["Normal"], fontName=FONT, fontSize=8,
         leading=11, textColor=colors.HexColor("#627789"), alignment=TA_CENTER,
     )
     label_style = ParagraphStyle(
-        "AZReceiptLabel", parent=base["Normal"], fontName=FONT, fontSize=8.3,
-        leading=11, textColor=colors.HexColor("#627789"),
+        "AZReceiptLabel", parent=base["Normal"], fontName=FONT, fontSize=8.0,
+        leading=10.2, textColor=colors.HexColor("#627789"),
     )
     value_style = ParagraphStyle(
         "AZReceiptValue", parent=label_style, fontName=FONT_BOLD, textColor=NAVY,
@@ -149,12 +153,12 @@ def build_payment_receipt_pdf(data: dict[str, Any]) -> bytes:
     story: list[Any] = []
 
     if LOGO_PATH.is_file():
-        logo = Image(str(LOGO_PATH), width=6.0 * cm, height=1.45 * cm, kind="proportional", hAlign="CENTER")
-        story.extend([logo, Spacer(1, 5)])
+        logo = Image(str(LOGO_PATH), width=5.5 * cm, height=1.28 * cm, kind="proportional", hAlign="CENTER")
+        story.extend([logo, Spacer(1, 4)])
     story.extend([
         Paragraph("TO'LOV CHEKI", title_style),
         Paragraph("AQL ZIYOSI o'quv markazi", subtitle_style),
-        Spacer(1, 9),
+        Spacer(1, 7),
     ])
 
     receipt_number = f"AZ-{int(data['payment_id']):08d}"
@@ -167,15 +171,35 @@ def build_payment_receipt_pdf(data: dict[str, Any]) -> bytes:
         [Paragraph("To'lov davri", label_style), Paragraph(_p(data.get("period")), value_style)],
         [Paragraph("To'lov usuli", label_style), Paragraph(_p(method), value_style)],
     ]
-    info = Table(info_rows, colWidths=[4.25 * cm, 8.0 * cm], hAlign="LEFT")
+    info = Table(info_rows, colWidths=[4.0 * cm, 8.25 * cm], hAlign="LEFT")
     info.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), PALE),
-        ("LINEBELOW", (0, 0), (-1, -1), 0.35, colors.HexColor("#DDE6EC")),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+        ("BOX", (0, 0), (-1, -1), 0.9, NAVY),
+        ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#DDE6EC")),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-        ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
-    story.extend([info, Spacer(1, 9)])
+    story.extend([info, Spacer(1, 7)])
+
+    paid_banner = Table([[
+        Paragraph("TO'LANDI", ParagraphStyle(
+            "AZReceiptPaidLabel", parent=label_style, fontName=FONT_BOLD,
+            textColor=GREEN, fontSize=10, alignment=TA_CENTER,
+        )),
+        Paragraph(_p(_money(data.get("payment_amount"))), ParagraphStyle(
+            "AZReceiptPaidAmount", parent=value_style, fontSize=17, leading=21,
+            alignment=TA_RIGHT,
+        )),
+    ]], colWidths=[3.0 * cm, 9.25 * cm], hAlign="LEFT")
+    paid_banner.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FFF7E3")),
+        ("BOX", (0, 0), (-1, -1), 1.1, GOLD),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 9), ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+        ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.extend([paid_banner, Spacer(1, 7)])
 
     breakdown = [
         [Paragraph("Oylik hisob", label_style), Paragraph(_p(_money(data.get("invoice_amount"))), value_style)],
@@ -193,19 +217,24 @@ def build_payment_receipt_pdf(data: dict[str, Any]) -> bytes:
         [Paragraph("Jami to'langan", label_style), Paragraph(_p(_money(data.get("paid_total"))), value_style)],
         [Paragraph("Qolgan qarz", label_style), Paragraph(_p(_money(data.get("remaining_due"))), value_style)],
     ])
+    payment_row_index = next(
+        index for index, row in enumerate(breakdown)
+        if isinstance(row[0], Paragraph) and getattr(row[0], "text", "") == "Ushbu chek summasi"
+    )
     amounts = Table(breakdown, colWidths=[7.0 * cm, 5.25 * cm], hAlign="LEFT")
     amounts.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-        ("BACKGROUND", (0, -3), (-1, -3), colors.HexColor("#FFF7E3")),
+        ("BACKGROUND", (0, payment_row_index), (-1, payment_row_index), colors.HexColor("#FFF7E3")),
         ("BACKGROUND", (0, -1), (-1, -1), PALE),
-        ("LINEABOVE", (0, -3), (-1, -3), 1, GOLD),
+        ("BOX", (0, 0), (-1, -1), 0.8, NAVY),
+        ("LINEABOVE", (0, payment_row_index), (-1, payment_row_index), 1, GOLD),
         ("LINEBELOW", (0, 0), (-1, -1), 0.35, colors.HexColor("#E5EBEF")),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("ALIGN", (1, 0), (1, -1), "RIGHT"),
         ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-        ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ]))
-    story.extend([amounts, Spacer(1, 7)])
+    story.extend([amounts, Spacer(1, 5)])
 
     stamp_and_note = Table([[
         PaymentStamp(receipt_number),
@@ -214,11 +243,11 @@ def build_payment_receipt_pdf(data: dict[str, Any]) -> bytes:
             "Ushbu elektron chek to'lov qaydini tasdiqlaydi.",
             ParagraphStyle("AZReceiptNote", parent=label_style, fontSize=7.2, leading=10),
         ),
-    ]], colWidths=[4.3 * cm, 7.95 * cm], hAlign="LEFT")
+    ]], colWidths=[3.65 * cm, 8.6 * cm], hAlign="LEFT")
     stamp_and_note.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-        ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("TOPPADDING", (0, 0), (-1, -1), 1), ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
     ]))
     story.extend([stamp_and_note, Spacer(1, 5)])
     story.append(Paragraph(
@@ -226,7 +255,23 @@ def build_payment_receipt_pdf(data: dict[str, Any]) -> bytes:
         ParagraphStyle("AZReceiptFooter", parent=subtitle_style, fontSize=7, leading=9),
     ))
 
-    doc.build(story)
+    def draw_receipt_page(canvas, document) -> None:
+        canvas.saveState()
+        page_width, page_height = A5
+        canvas.setStrokeColor(NAVY)
+        canvas.setLineWidth(1.0)
+        canvas.rect(0.55 * cm, 0.55 * cm, page_width - 1.1 * cm, page_height - 1.1 * cm, stroke=1, fill=0)
+        canvas.setStrokeColor(GOLD)
+        canvas.setLineWidth(0.45)
+        canvas.rect(0.68 * cm, 0.68 * cm, page_width - 1.36 * cm, page_height - 1.36 * cm, stroke=1, fill=0)
+        canvas.setFillColor(NAVY)
+        canvas.rect(0.55 * cm, page_height - 0.75 * cm, page_width - 1.1 * cm, 0.2 * cm, stroke=0, fill=1)
+        canvas.setFont(FONT, 6.3)
+        canvas.setFillColor(colors.HexColor("#627789"))
+        canvas.drawCentredString(page_width / 2, 0.87 * cm, "AQL ZIYOSI  |  ELEKTRON TO'LOV CHEKI")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=draw_receipt_page, onLaterPages=draw_receipt_page)
     return output.getvalue()
 
 

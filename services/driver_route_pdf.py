@@ -12,13 +12,13 @@ from typing import Any
 
 import reportlab
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_LEFT, TA_RIGHT
+from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from config import settings
 
@@ -127,7 +127,7 @@ def _status(value: str) -> str:
 
 
 def build_driver_daily_pdf(trips: list[dict[str, Any]], driver_name: str, date_str: str) -> bytes:
-    """Render all of a driver's trips as one chronological, time-grouped PDF."""
+    """Render one readable, chronological route plan for all trips assigned to a driver."""
     output = io.BytesIO()
     doc = SimpleDocTemplate(
         output, pagesize=A4, rightMargin=1.45 * cm, leftMargin=1.45 * cm,
@@ -137,8 +137,8 @@ def build_driver_daily_pdf(trips: list[dict[str, Any]], driver_name: str, date_s
     )
     base = getSampleStyleSheet()
     title_style = ParagraphStyle(
-        "AZTitle", parent=base["Title"], fontName=FONT_BOLD, fontSize=19,
-        leading=23, textColor=NAVY, alignment=TA_LEFT, spaceAfter=4,
+        "AZTitle", parent=base["Title"], fontName=FONT_BOLD, fontSize=18,
+        leading=22, textColor=NAVY, alignment=TA_LEFT, spaceAfter=3,
     )
     subtitle_style = ParagraphStyle(
         "AZSubtitle", parent=base["Normal"], fontName=FONT, fontSize=9,
@@ -149,8 +149,15 @@ def build_driver_daily_pdf(trips: list[dict[str, Any]], driver_name: str, date_s
         leading=15, textColor=NAVY, spaceBefore=6, spaceAfter=6,
     )
     cell_style = ParagraphStyle(
-        "AZCell", parent=base["Normal"], fontName=FONT, fontSize=8.4,
-        leading=11, textColor=NAVY,
+        "AZCell", parent=base["Normal"], fontName=FONT, fontSize=8.1,
+        leading=10.5, textColor=NAVY,
+    )
+    stop_time_style = ParagraphStyle(
+        "AZStopTime", parent=cell_style, fontName=FONT_BOLD, fontSize=10.5,
+        leading=13, textColor=NAVY, alignment=TA_CENTER,
+    )
+    student_list_style = ParagraphStyle(
+        "AZStudentList", parent=cell_style, fontSize=8.0, leading=11,
     )
     small_style = ParagraphStyle(
         "AZSmall", parent=base["Normal"], fontName=FONT, fontSize=7.5,
@@ -161,14 +168,17 @@ def build_driver_daily_pdf(trips: list[dict[str, Any]], driver_name: str, date_s
         textColor=colors.white,
     )
     story: list[Any] = [
-        Paragraph("Bugungi reyslar", title_style),
-        Paragraph(f"{_safe(driver_name)} | Sana: {_safe(date_str)}", subtitle_style),
+        Paragraph("HAYDOVCHI UCHUN YO'NALISH", title_style),
+        Paragraph(
+            f"{_safe(driver_name)}  |  {_safe(date_str)}  |  Har bir manzil va o'quvchi vaqti ketma-ket berilgan",
+            subtitle_style,
+        ),
     ]
 
     totals = Table(
         [[Paragraph(f"<b>{len(trips)}</b><br/>REYS", cell_style),
           Paragraph(f"<b>{sum(len(t.get('items', [])) for t in trips)}</b><br/>O'QUVCHI", cell_style),
-          Paragraph("VAQT BO'YICHA TARTIBLANGAN", cell_style)]],
+          Paragraph("VAQT VA MAHALLA BO'YICHA TARTIBLANGAN", cell_style)]],
         colWidths=[3.0 * cm, 3.0 * cm, 10.9 * cm],
     )
     totals.setStyle(TableStyle([
@@ -179,9 +189,10 @@ def build_driver_daily_pdf(trips: list[dict[str, Any]], driver_name: str, date_s
     ]))
     story.extend([totals, Spacer(1, 12)])
 
-    for trip_number, trip in enumerate(sorted(trips, key=lambda row: (row.get("planned_time", ""), row.get("id", 0))), start=1):
+    ordered_trips = sorted(trips, key=lambda row: (row.get("planned_time", ""), row.get("id", 0)))
+    for trip_number, trip in enumerate(ordered_trips, start=1):
         center_trip = trip.get("direction") == "to_center"
-        direction = "MARKAZGA KELISH" if center_trip else "UYGA QAYTISH"
+        direction = "MARKAZGA OLIB KELISH" if center_trip else "MARKAZDAN UYGA QAYTISH"
         status = _status(str(trip.get("status", "")))
         heading = Table([[
             Paragraph(f"{_safe(trip.get('planned_time'))} | {direction}", section_style),
@@ -199,33 +210,61 @@ def build_driver_daily_pdf(trips: list[dict[str, Any]], driver_name: str, date_s
         pickup_times = estimate_pickup_times(trip) if center_trip else {}
         items = list(trip.get("items", []))
         if center_trip:
-            items.sort(key=lambda item: (pickup_times.get(int(item.get("id", 0)), "99:99"), item.get("route_order", 0), item.get("full_name", "")))
-            time_header = "Olish / dars vaqti"
+            grouped: dict[int, list[dict[str, Any]]] = {}
+            for item in items:
+                if item.get("status") != "absent":
+                    grouped.setdefault(int(item["village_id"]), []).append(item)
+            route_items = sorted(
+                (group for group in grouped.values()),
+                key=lambda group: (
+                    min(pickup_times.get(int(item.get("id", 0)), "99:99") for item in group),
+                    group[0].get("route_order", 0),
+                ),
+            )
+            rows: list[list[Any]] = [[
+                Paragraph("STOP", header_style),
+                Paragraph("OLISH VAQTI", header_style),
+                Paragraph("MAHALLA / MANZIL", header_style),
+                Paragraph("O'QUVCHILAR  |  DARS VAQTI", header_style),
+            ]]
+            for stop_number, stop_items in enumerate(route_items, start=1):
+                first = stop_items[0]
+                pickup_time = pickup_times.get(int(first.get("id", 0)), "--:--")
+                lesson_lines = []
+                for item in sorted(stop_items, key=lambda value: (value.get("lesson_start_time") or "99:99", value.get("full_name", ""))):
+                    lesson_time = item.get("lesson_start_time") or "--:--"
+                    lesson_lines.append(f"<b>{_safe(item.get('full_name', 'Oquvchi'))}</b>  |  dars {_safe(lesson_time)}")
+                pickup_place = " / ".join(
+                    part for part in (_latin_text(first.get("village_name", "")), _latin_text(first.get("pickup_point", "")))
+                    if part
+                )
+                rows.append([
+                    Paragraph(f"{stop_number:02d}", cell_style),
+                    Paragraph(_safe(pickup_time), stop_time_style),
+                    Paragraph(_safe(pickup_place), cell_style),
+                    Paragraph("<br/>".join(lesson_lines), student_list_style),
+                ])
+            table = Table(
+                rows, colWidths=[0.85 * cm, 2.35 * cm, 4.55 * cm, 10.15 * cm],
+                repeatRows=1, hAlign="LEFT",
+            )
         else:
             items.sort(key=lambda item: (item.get("lesson_end_time") or "99:99", item.get("route_order", 0), item.get("full_name", "")))
-            time_header = "Dars tugashi"
-
-        rows: list[list[Any]] = [[
-            Paragraph("#", header_style), Paragraph(time_header, header_style),
-            Paragraph("O'quvchi", header_style), Paragraph("Mahalla / olish joyi", header_style),
-            Paragraph("Holat", header_style),
-        ]]
-        for index, item in enumerate(items, start=1):
-            if center_trip:
-                pickup_time = pickup_times.get(int(item.get("id", 0)), "--:--")
-                lesson_start = item.get("lesson_start_time")
-                item_time = f"{pickup_time} / {lesson_start}" if lesson_start else pickup_time
-            else:
+            rows = [[
+                Paragraph("#", header_style), Paragraph("DARS TUGASHI", header_style),
+                Paragraph("O'QUVCHI", header_style), Paragraph("MAHALLA / MANZIL", header_style),
+                Paragraph("HOLAT", header_style),
+            ]]
+            for index, item in enumerate(items, start=1):
                 item_time = item.get("lesson_end_time") or trip.get("planned_time") or "--:--"
-            pickup = " / ".join(part for part in (_latin_text(item.get("village_name", "")), _latin_text(item.get("pickup_point", ""))) if part)
-            rows.append([
-                Paragraph(str(index), cell_style),
-                Paragraph(_safe(item_time), cell_style),
-                Paragraph(f"<b>{_safe(item.get('full_name', 'Oquvchi'))}</b>", cell_style),
-                Paragraph(_safe(pickup), cell_style),
-                Paragraph(_safe(_status(str(item.get("status", "")))), cell_style),
-            ])
-        table = Table(rows, colWidths=[0.65 * cm, 3.0 * cm, 4.0 * cm, 5.7 * cm, 3.3 * cm], repeatRows=1, hAlign="LEFT")
+                pickup = " / ".join(part for part in (_latin_text(item.get("village_name", "")), _latin_text(item.get("pickup_point", ""))) if part)
+                rows.append([
+                    Paragraph(str(index), cell_style), Paragraph(_safe(item_time), cell_style),
+                    Paragraph(f"<b>{_safe(item.get('full_name', 'Oquvchi'))}</b>", cell_style),
+                    Paragraph(_safe(pickup), cell_style),
+                    Paragraph(_safe(_status(str(item.get("status", "")))), cell_style),
+                ])
+            table = Table(rows, colWidths=[0.65 * cm, 3.0 * cm, 4.0 * cm, 5.7 * cm, 3.3 * cm], repeatRows=1, hAlign="LEFT")
         table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), NAVY), ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, PALE]),
             ("LINEBELOW", (0, 0), (-1, 0), 1.2, GOLD), ("LINEBELOW", (0, 1), (-1, -1), 0.35, colors.HexColor("#DFE7EC")),
@@ -233,13 +272,18 @@ def build_driver_daily_pdf(trips: list[dict[str, Any]], driver_name: str, date_s
             ("RIGHTPADDING", (0, 0), (-1, -1), 6), ("TOPPADDING", (0, 0), (-1, -1), 6),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
         ]))
-        trip_story: list[Any] = [heading, table]
+        story.extend([heading, table])
         if center_trip:
-            trip_story.append(Paragraph("Olish vaqti reysning yo'l va to'xtash rejasidan hisoblangan.", small_style))
+            story.append(Paragraph("Olish vaqti yo'l masofasi va manzil ketma-ketligiga qarab taxmin qilingan.", small_style))
+            absent_names = [item.get("full_name") for item in items if item.get("status") == "absent"]
+            if absent_names:
+                story.append(Paragraph(
+                    "Bugun kelmaydi: " + ", ".join(_safe(name) for name in absent_names),
+                    small_style,
+                ))
         else:
-            trip_story.append(Paragraph(f"Markazdan reys boshlanishi: {_safe(trip.get('planned_time'))}.", small_style))
-        trip_story.append(Spacer(1, 12))
-        story.append(KeepTogether(trip_story))
+            story.append(Paragraph(f"Markazdan reys boshlanishi: {_safe(trip.get('planned_time'))}.", small_style))
+        story.append(Spacer(1, 12))
 
     if not trips:
         story.append(Paragraph("Bugun sizga biriktirilgan reys yo'q.", cell_style))
@@ -248,7 +292,10 @@ def build_driver_daily_pdf(trips: list[dict[str, Any]], driver_name: str, date_s
         canvas.saveState()
         page_width, page_height = A4
         canvas.setFillColor(NAVY)
-        canvas.rect(0, page_height - 0.55 * cm, page_width, 0.55 * cm, fill=1, stroke=0)
+        canvas.rect(0, page_height - 0.48 * cm, page_width, 0.48 * cm, fill=1, stroke=0)
+        canvas.setStrokeColor(GOLD)
+        canvas.setLineWidth(1.2)
+        canvas.line(1.45 * cm, page_height - 2.0 * cm, page_width - 1.45 * cm, page_height - 2.0 * cm)
         if LOGO_PATH.is_file():
             canvas.drawImage(str(LOGO_PATH), 1.45 * cm, page_height - 1.85 * cm,
                              width=4.7 * cm, height=1.13 * cm, preserveAspectRatio=True, anchor="sw", mask="auto")

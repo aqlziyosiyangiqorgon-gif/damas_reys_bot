@@ -17,6 +17,7 @@ from config import settings
 from database.db import Database
 from services.trip_builder import TripBuilder
 from services.driver_route_pdf import build_driver_daily_pdf, estimate_pickup_times
+from services.driver_route_controls import build_driver_trip_keyboard, format_trip_card_text
 from models.enums import TripDirection, TripStatus
 from models.callbacks import ApproveTripsCallback, DriverStartTripCallback
 from utils.text import escape_html
@@ -138,6 +139,19 @@ class SchedulerService:
                     continue
                 for trip_id in trip_ids:
                     await self.db.mark_driver_advance_reminder_sent(trip_id, sent_at)
+                for trip in driver_trips:
+                    try:
+                        control_status = await safe_send(
+                            self.bot,
+                            driver_tg_id,
+                            format_trip_card_text(trip),
+                            reply_markup=build_driver_trip_keyboard(trip),
+                            parse_mode="HTML",
+                        )
+                        if control_status != "sent":
+                            logger.warning("Driver route controls delivery failed (%s)", control_status)
+                    except Exception as control_exc:
+                        logger.error("Driver route controls failed (%s)", type(control_exc).__name__)
                 sent_count += len(trip_ids)
             except Exception as exc:
                 logger.error("Driver advance PDF failed for route group (%s)", type(exc).__name__)
