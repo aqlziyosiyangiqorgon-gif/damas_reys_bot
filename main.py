@@ -21,6 +21,9 @@ from middlewares.sqlite_storage import SQLiteFSMStorage
 from services.miniapp_server import MiniAppServer
 from aiogram.types import MenuButtonWebApp, WebAppInfo
 
+payment_flow_router.message.filter(F.from_user.id.in_(settings.admin_ids_list))
+payment_flow_router.callback_query.filter(F.from_user.id.in_(settings.admin_ids_list))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s"
