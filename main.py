@@ -12,6 +12,7 @@ from middlewares.roles import RoleMiddleware, TelegramApiFailureMiddleware, Inva
 from handlers.common import common_router
 from handlers.payments import payment_router
 from handlers.payment_flow import payment_flow_router
+from handlers.payment_navigation import payment_navigation_router
 from handlers.admin import admin_router
 from handlers.driver import driver_router
 from handlers.staff import staff_router
@@ -73,6 +74,7 @@ async def main():
     # Routerlarni qat'iy ketma-ketlikda ulash
     dp.include_router(common_router)
     dp.include_router(payment_flow_router)
+    dp.include_router(payment_navigation_router)
     dp.include_router(payment_router)
     dp.include_router(admin_router)
     dp.include_router(driver_router)
