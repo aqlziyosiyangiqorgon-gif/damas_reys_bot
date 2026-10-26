@@ -1,5 +1,3 @@
-from typing import Optional
-
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -16,6 +14,11 @@ from models.callbacks import (
     BillingPaymentMethodCallback,
     BillingDiscountStartCallback,
 )
+from models.payment_callbacks import (
+    PaymentDashboardCallback,
+    PaymentActionCallback,
+    PaymentStudentHistoryCallback,
+)
 from services.payment_receipt import send_payment_receipt
 from services.telegram_safe import safe_send
 from utils.clock import now_tz
@@ -27,16 +30,27 @@ payment_router.message.filter(F.from_user.id.in_(settings.admin_ids_list))
 payment_router.callback_query.filter(F.from_user.id.in_(settings.admin_ids_list))
 
 PAGE_SIZE = 8
+HISTORY_PAGE_SIZE = 12
 
 
 class PaymentCenterStates(StatesGroup):
     waiting_for_payment_amount = State()
     waiting_for_discount_amount = State()
     waiting_for_discount_reason = State()
+    waiting_for_student_search = State()
 
 
 def _money(value: int | None) -> str:
     return f"{int(value or 0):,}".replace(",", " ") + " so'm"
+
+
+def _short_money(value: int | None) -> str:
+    value = int(value or 0)
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f} mln"
+    if value >= 1_000:
+        return f"{value / 1_000:.0f} ming"
+    return f"{value} so'm"
 
 
 def _shift_period(period: str, move: str) -> str:
@@ -64,8 +78,8 @@ def _status(student: dict) -> tuple[str, str]:
     if due <= 0:
         return "🟢", "To'langan"
     if int(student.get("paid_total") or 0) > 0:
-        return "🟡", f"Qisman · {_money(due)} qarz"
-    return "🔴", f"Qarz · {_money(due)}"
+        return "🟡", f"Qisman · {_short_money(due)} qarz"
+    return "🔴", f"Qarz · {_short_money(due)}"
 
 
 def _dashboard_keyboard(period: str) -> InlineKeyboardMarkup:
@@ -75,7 +89,14 @@ def _dashboard_keyboard(period: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=f"📅 {period}", callback_data="noop"),
             InlineKeyboardButton(text="▶️", callback_data=BillingPeriodCallback(period=period, move="n").pack()),
         ],
-        [InlineKeyboardButton(text="👥 O'quvchilar bo'yicha", callback_data=BillingListCallback(period=period).pack())],
+        [
+            InlineKeyboardButton(text="👥 O'quvchilar", callback_data=BillingListCallback(period=period).pack()),
+            InlineKeyboardButton(text="🔎 Qidirish", callback_data=PaymentActionCallback(action="search", period=period).pack()),
+        ],
+        [
+            InlineKeyboardButton(text="📊 Hisobot", callback_data=PaymentActionCallback(action="report", period=period).pack()),
+            InlineKeyboardButton(text="📜 To'lovlar tarixi", callback_data=PaymentActionCallback(action="history", period=period).pack()),
+        ],
     ])
 
 
@@ -97,7 +118,7 @@ def _student_list_keyboard(students: list, period: str, page: int) -> InlineKeyb
     if page + 1 < total_pages:
         nav.append(InlineKeyboardButton(text="➡️", callback_data=BillingPageCallback(page=page + 1, period=period).pack()))
     rows.append(nav)
-    rows.append([InlineKeyboardButton(text="⬅️ To'lov markazi", callback_data=BillingListCallback(period=period).pack())])
+    rows.append([InlineKeyboardButton(text="⬅️ To'lov markazi", callback_data=PaymentDashboardCallback(period=period).pack())])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -112,8 +133,18 @@ def _student_keyboard(student_id: int, period: str, due: int) -> InlineKeyboardM
             text="🎁 Chegirma berish",
             callback_data=BillingDiscountStartCallback(student_id=student_id, period=period).pack(),
         )])
+    rows.append([InlineKeyboardButton(
+        text="📜 To'lovlar tarixi",
+        callback_data=PaymentStudentHistoryCallback(student_id=student_id, period=period).pack(),
+    )])
     rows.append([InlineKeyboardButton(text="⬅️ O'quvchilar", callback_data=BillingListCallback(period=period).pack())])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _back_dashboard_keyboard(period: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⬅️ To'lov markazi", callback_data=PaymentDashboardCallback(period=period).pack())
+    ]])
 
 
 async def _show_dashboard(message: types.Message, db: Database, period: str, edit: bool = False):
@@ -122,25 +153,44 @@ async def _show_dashboard(message: types.Message, db: Database, period: str, edi
     entered = [s for s in students if s.get("invoice_id") is not None]
     paid = sum(int(s.get("paid_total") or 0) for s in entered)
     due = sum(max(0, int(s.get("due") or 0)) for s in entered)
+    discounts = sum(int(s.get("discount") or 0) for s in entered)
     debtors = sum(1 for s in entered if s.get("status") != "waived" and int(s.get("due") or 0) > 0)
     paid_students = sum(1 for s in entered if s.get("status") != "waived" and int(s.get("due") or 0) <= 0)
     not_ready = len(students) - len(entered)
     collection = (paid / (paid + due) * 100) if paid + due else 0
 
+    conn = await db.get_connection()
+    try:
+        cur = await conn.execute(
+            "SELECT COALESCE(SUM(p.amount), 0) AS amount FROM payments p "
+            "JOIN invoices i ON i.id = p.invoice_id WHERE i.period = ? AND p.method = 'cash'",
+            (period,),
+        )
+        cash = int((await cur.fetchone())["amount"] or 0)
+        cur = await conn.execute(
+            "SELECT COALESCE(SUM(p.amount), 0) AS amount FROM payments p "
+            "JOIN invoices i ON i.id = p.invoice_id WHERE i.period = ? AND p.method = 'card'",
+            (period,),
+        )
+        card = int((await cur.fetchone())["amount"] or 0)
+    finally:
+        await conn.close()
+
     text = (
         f"💳 <b>TO'LOV MARKAZI</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📅 <b>{escape_html(period)}</b>\n\n"
-        f"💰 <b>{_money(paid)}</b>\n"
-        f"<i>Jami tushum</i>\n\n"
-        f"⏳ <b>{_money(due)}</b>\n"
-        f"<i>Qolgan qarzdorlik</i>\n\n"
-        f"👥 <b>{len(students)}</b>  o'quvchi   ·   🧾 <b>{len(entered)}</b>  hisob\n"
+        f"💰 <b>{_money(paid)}</b>  ·  ⏳ <b>{_money(due)}</b>\n"
+        f"<i>Tushum · qolgan qarzdorlik</i>\n\n"
         f"🟢 <b>{paid_students}</b> to'lagan   ·   🔴 <b>{debtors}</b> qarzdor\n"
-        f"⚠️ <b>{not_ready}</b> hisob tayyor emas\n\n"
+        f"👥 <b>{len(students)}</b> o'quvchi   ·   🧾 <b>{len(entered)}</b> hisob\n"
+        f"🎁 Chegirmalar: <b>{_money(discounts)}</b>\n\n"
+        f"💵 Naqd: <b>{_money(cash)}</b>\n"
+        f"💳 Karta: <b>{_money(card)}</b>\n"
         f"📊 Undirish darajasi: <b>{collection:.0f}%</b>\n"
+        f"⚠️ Hisobi tayyor emas: <b>{not_ready}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Quyidan o'quvchilarni tanlab, to'lov yoki chegirmani boshqaring."
+        f"Kerakli bo'limni tanlang."
     )
     keyboard = _dashboard_keyboard(period)
     if edit:
@@ -205,10 +255,190 @@ async def _show_student(message: types.Message, db: Database, student_id: int, p
     await safe_telegram_call(message.edit_text, text, reply_markup=keyboard, parse_mode="HTML")
 
 
+async def _search_students(db: Database, query: str) -> list[dict]:
+    normalized = query.strip().casefold()
+    digits = "".join(ch for ch in query if ch.isdigit())
+    conn = await db.get_connection()
+    try:
+        if digits and len(digits) >= 5:
+            pattern = f"%{digits}%"
+            cur = await conn.execute(
+                "SELECT id, full_name, parent_phone_1, parent_phone_2 FROM students "
+                "WHERE is_active = 1 AND (full_name LIKE ? COLLATE NOCASE "
+                "OR replace(replace(replace(parent_phone_1, '+', ''), ' ', ''), '-', '') LIKE ? "
+                "OR replace(replace(replace(parent_phone_2, '+', ''), ' ', ''), '-', '') LIKE ?) "
+                "ORDER BY full_name LIMIT 12",
+                (f"%{normalized}%", pattern, pattern),
+            )
+        else:
+            cur = await conn.execute(
+                "SELECT id, full_name, parent_phone_1, parent_phone_2 FROM students "
+                "WHERE is_active = 1 AND full_name LIKE ? COLLATE NOCASE "
+                "ORDER BY full_name LIMIT 12",
+                (f"%{normalized}%",),
+            )
+        return [dict(row) for row in await cur.fetchall()]
+    finally:
+        await conn.close()
+
+
+async def _show_search_results(message: types.Message, db: Database, period: str, query: str):
+    students = await _search_students(db, query)
+    if not students:
+        await message.answer(
+            f"🔎 <b>Qidiruv</b>\n\n«{escape_html(query)}» bo'yicha o'quvchi topilmadi.",
+            reply_markup=_back_dashboard_keyboard(period), parse_mode="HTML",
+        )
+        return
+    rows = []
+    for student in students:
+        rows.append([InlineKeyboardButton(
+            text=f"👤 {student['full_name']}",
+            callback_data=BillingStudentCallback(student_id=student["id"], period=period).pack(),
+        )])
+    rows.append([InlineKeyboardButton(text="⬅️ To'lov markazi", callback_data=PaymentDashboardCallback(period=period).pack())])
+    await message.answer(
+        f"🔎 <b>QIDIRUV NATIJALARI</b>\n\n«{escape_html(query)}» · {len(students)} ta natija",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML",
+    )
+
+
+async def _show_report(message: types.Message, db: Database, period: str):
+    conn = await db.get_connection()
+    try:
+        cur = await conn.execute(
+            "SELECT COALESCE(SUM(p.amount),0) AS total, "
+            "COALESCE(SUM(CASE WHEN p.method='cash' THEN p.amount ELSE 0 END),0) AS cash, "
+            "COALESCE(SUM(CASE WHEN p.method='card' THEN p.amount ELSE 0 END),0) AS card, "
+            "COUNT(*) AS count FROM payments p JOIN invoices i ON i.id=p.invoice_id WHERE i.period=?",
+            (period,),
+        )
+        payments = dict(await cur.fetchone())
+        cur = await conn.execute(
+            "SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS count FROM discount_log "
+            "WHERE invoice_id IN (SELECT id FROM invoices WHERE period=?)",
+            (period,),
+        )
+        discounts = dict(await cur.fetchone())
+    finally:
+        await conn.close()
+
+    text = (
+        f"📊 <b>TO'LOV HISOBOTI</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 <b>{escape_html(period)}</b>\n\n"
+        f"💰 Jami tushum: <b>{_money(payments['total'])}</b>\n"
+        f"💵 Naqd: <b>{_money(payments['cash'])}</b>\n"
+        f"💳 Karta: <b>{_money(payments['card'])}</b>\n"
+        f"🧾 To'lovlar soni: <b>{payments['count']}</b> ta\n\n"
+        f"🎁 Chegirmalar: <b>{_money(discounts['total'])}</b>\n"
+        f"📋 Chegirma yozuvlari: <b>{discounts['count']}</b> ta\n\n"
+        f"Bu hisobot faqat tanlangan oy ma'lumotlari asosida tuziladi."
+    )
+    await safe_telegram_call(message.edit_text, text, reply_markup=_back_dashboard_keyboard(period), parse_mode="HTML")
+
+
+async def _show_history(message: types.Message, db: Database, period: str):
+    conn = await db.get_connection()
+    try:
+        cur = await conn.execute(
+            "SELECT p.amount, p.method, p.paid_at, s.full_name "
+            "FROM payments p JOIN invoices i ON i.id=p.invoice_id "
+            "JOIN students s ON s.id=i.student_id WHERE i.period=? "
+            "ORDER BY p.paid_at DESC LIMIT ?",
+            (period, HISTORY_PAGE_SIZE),
+        )
+        rows = [dict(row) for row in await cur.fetchall()]
+    finally:
+        await conn.close()
+
+    if not rows:
+        text = f"📜 <b>TO'LOVLAR TARIXI</b>\n📅 {escape_html(period)}\n\nHozircha to'lovlar yo'q."
+    else:
+        lines = [f"📜 <b>TO'LOVLAR TARIXI</b>", f"📅 {escape_html(period)}", "━━━━━━━━━━━━━━━━━━━━"]
+        for row in rows:
+            method = "Naqd" if row["method"] == "cash" else "Karta"
+            paid_at = str(row["paid_at"] or "")[:16]
+            lines.append(
+                f"👤 {escape_html(row['full_name'])}\n"
+                f"   💰 <b>{_money(row['amount'])}</b> · {method} · {escape_html(paid_at)}"
+            )
+        lines.append(f"\n<i>Oxirgi {len(rows)} ta to'lov ko'rsatildi.</i>")
+        text = "\n".join(lines)
+    await safe_telegram_call(message.edit_text, text, reply_markup=_back_dashboard_keyboard(period), parse_mode="HTML")
+
+
+async def _show_student_history(message: types.Message, db: Database, student_id: int, period: str):
+    student = await db.get_student_by_id(student_id)
+    if not student:
+        await safe_telegram_call(message.edit_text, "❌ O'quvchi topilmadi.")
+        return
+    conn = await db.get_connection()
+    try:
+        cur = await conn.execute(
+            "SELECT p.amount, p.method, p.paid_at FROM payments p JOIN invoices i ON i.id=p.invoice_id "
+            "WHERE i.student_id=? AND i.period=? ORDER BY p.paid_at DESC LIMIT 20",
+            (student_id, period),
+        )
+        rows = [dict(row) for row in await cur.fetchall()]
+    finally:
+        await conn.close()
+    if rows:
+        lines = [f"📜 <b>{escape_html(student['full_name'])}</b>", f"📅 {escape_html(period)}", "━━━━━━━━━━━━━━━━━━━━"]
+        for row in rows:
+            method = "Naqd" if row["method"] == "cash" else "Karta"
+            lines.append(f"💰 <b>{_money(row['amount'])}</b> · {method} · {escape_html(str(row['paid_at'])[:16])}")
+        text = "\n".join(lines)
+    else:
+        text = f"📜 <b>{escape_html(student['full_name'])}</b>\n📅 {escape_html(period)}\n\nBu oyda to'lov tarixi yo'q."
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ O'quvchi", callback_data=BillingStudentCallback(student_id=student_id, period=period).pack())],
+        [InlineKeyboardButton(text="🏠 To'lov markazi", callback_data=PaymentDashboardCallback(period=period).pack())],
+    ])
+    await safe_telegram_call(message.edit_text, text, reply_markup=keyboard, parse_mode="HTML")
+
+
 @payment_router.message(F.text.in_({"💳 To'lov markazi", "💰 Oylik to'lovlar"}))
 async def open_payment_center(message: types.Message, state: FSMContext, db: Database):
     await state.clear()
     await _show_dashboard(message, db, now_tz().strftime("%Y-%m"))
+
+
+@payment_router.callback_query(PaymentDashboardCallback.filter())
+async def payment_dashboard(callback: types.CallbackQuery, db: Database, callback_data: PaymentDashboardCallback):
+    await _show_dashboard(callback.message, db, callback_data.period, edit=True)
+    await callback.answer()
+
+
+@payment_router.callback_query(PaymentActionCallback.filter())
+async def payment_action(callback: types.CallbackQuery, state: FSMContext, db: Database, callback_data: PaymentActionCallback):
+    if callback_data.action == "search":
+        await state.clear()
+        await state.update_data(payment_period=callback_data.period)
+        await state.set_state(PaymentCenterStates.waiting_for_student_search)
+        await safe_telegram_call(
+            callback.message.edit_text,
+            "🔎 <b>O'QUVCHI QIDIRISH</b>\n\nIsm-familiya yoki ota-ona telefon raqamini yuboring:",
+            reply_markup=_back_dashboard_keyboard(callback_data.period),
+            parse_mode="HTML",
+        )
+    elif callback_data.action == "report":
+        await _show_report(callback.message, db, callback_data.period)
+    else:
+        await _show_history(callback.message, db, callback_data.period)
+    await callback.answer()
+
+
+@payment_router.message(PaymentCenterStates.waiting_for_student_search, F.text)
+async def payment_search(message: types.Message, state: FSMContext, db: Database):
+    data = await state.get_data()
+    period = data.get("payment_period") or now_tz().strftime("%Y-%m")
+    query = (message.text or "").strip()
+    if len(query) < 2:
+        await message.answer("Kamida 2 ta belgi kiriting.")
+        return
+    await state.clear()
+    await _show_search_results(message, db, period, query)
 
 
 @payment_router.callback_query(BillingPeriodCallback.filter())
@@ -233,6 +463,12 @@ async def payment_page(callback: types.CallbackQuery, db: Database, callback_dat
 @payment_router.callback_query(BillingStudentCallback.filter())
 async def payment_student(callback: types.CallbackQuery, db: Database, callback_data: BillingStudentCallback):
     await _show_student(callback.message, db, callback_data.student_id, callback_data.period)
+    await callback.answer()
+
+
+@payment_router.callback_query(PaymentStudentHistoryCallback.filter())
+async def payment_student_history(callback: types.CallbackQuery, db: Database, callback_data: PaymentStudentHistoryCallback):
+    await _show_student_history(callback.message, db, callback_data.student_id, callback_data.period)
     await callback.answer()
 
 
