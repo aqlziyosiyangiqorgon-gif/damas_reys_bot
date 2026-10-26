@@ -88,9 +88,7 @@
 
     card.insertBefore(table, directParagraphs[0] || card.querySelector(":scope > .admin-form") || null);
 
-    for (const paragraph of directParagraphs) {
-      paragraph.remove();
-    }
+    for (const paragraph of directParagraphs) paragraph.remove();
 
     const tariffForm = [...card.querySelectorAll(":scope > .admin-form")].find(form => {
       const title = form.querySelector("h3")?.textContent || "";
@@ -142,6 +140,37 @@
     document.querySelectorAll(".billing-list > .card").forEach(redesignBillingCard);
   }
 
+  // Admin bo‘limlari gorizontal tab bo‘lgani uchun qayta render paytida
+  // scrollLeft nolga tushib ketmasin. Oldingi joy saqlanadi.
+  let adminTabsScrollLeft = null;
+
+  function initAdminTabScrollFix() {
+    const content = document.getElementById("content");
+    if (!content) return;
+
+    content.addEventListener("click", event => {
+      const tab = event.target.closest?.(".admin-tab");
+      if (!tab) return;
+      const tabs = tab.parentElement;
+      if (tabs?.classList.contains("admin-tabs")) {
+        adminTabsScrollLeft = tabs.scrollLeft;
+      }
+    }, true);
+
+    const restore = () => {
+      if (adminTabsScrollLeft === null) return;
+      const tabs = content.querySelector(".admin-tabs");
+      if (!tabs) return;
+      const saved = adminTabsScrollLeft;
+      adminTabsScrollLeft = null;
+      tabs.scrollLeft = Math.max(0, Math.min(saved, tabs.scrollWidth - tabs.clientWidth));
+    };
+
+    new MutationObserver(() => {
+      if (adminTabsScrollLeft !== null) requestAnimationFrame(restore);
+    }).observe(content, { childList: true });
+  }
+
   const observer = new MutationObserver(() => {
     window.requestAnimationFrame(redesignBillingCards);
   });
@@ -151,6 +180,7 @@
     if (!content) return;
     observer.observe(content, { childList: true, subtree: true });
     redesignBillingCards();
+    initAdminTabScrollFix();
   }
 
   if (document.readyState === "loading") {
