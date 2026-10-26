@@ -2,6 +2,7 @@ from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+from config import settings
 from database.db import Database
 from models.callbacks import (
     BillingPaymentStartCallback,
@@ -11,6 +12,8 @@ from models.callbacks import (
 from handlers.payments import PaymentCenterStates, _money, _show_student
 
 payment_flow_router = Router()
+payment_flow_router.message.filter(F.from_user.id.in_(settings.admin_ids_list))
+payment_flow_router.callback_query.filter(F.from_user.id.in_(settings.admin_ids_list))
 
 
 def _cancel_keyboard() -> InlineKeyboardMarkup:
