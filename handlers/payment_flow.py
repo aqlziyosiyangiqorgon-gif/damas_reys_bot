@@ -66,7 +66,7 @@ async def payment_cancel(callback: types.CallbackQuery, state: FSMContext, db: D
     await callback.answer("Bekor qilindi")
 
 
-@payment_flow_router.message(Command := F.command("cancel"))
+@payment_flow_router.message(F.text == "/cancel")
 async def payment_cancel_command(message: types.Message, state: FSMContext, db: Database):
     data = await state.get_data()
     student_id = data.get("student_id")
