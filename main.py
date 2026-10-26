@@ -15,6 +15,7 @@ from handlers.payment_flow import payment_flow_router
 from handlers.payment_navigation import payment_navigation_router
 from handlers.admin import admin_router
 from handlers.driver import driver_router
+from handlers.driver_bulk import driver_bulk_router
 from handlers.staff import staff_router
 from handlers.parent import parent_router
 from services.scheduler_service import SchedulerService
@@ -77,6 +78,9 @@ async def main():
     dp.include_router(payment_navigation_router)
     dp.include_router(payment_router)
     dp.include_router(admin_router)
+    # Village-level driver actions must run before the legacy per-student
+    # callbacks in driver_router. Existing driver handlers remain untouched.
+    dp.include_router(driver_bulk_router)
     dp.include_router(driver_router)
     dp.include_router(staff_router)
     dp.include_router(parent_router)
