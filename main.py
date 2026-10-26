@@ -11,6 +11,7 @@ from database.db import Database
 from middlewares.roles import RoleMiddleware, TelegramApiFailureMiddleware, InvalidCallbackMiddleware
 from handlers.common import common_router
 from handlers.payments import payment_router
+from handlers.payment_flow import payment_flow_router
 from handlers.admin import admin_router
 from handlers.driver import driver_router
 from handlers.staff import staff_router
@@ -71,6 +72,7 @@ async def main():
 
     # Routerlarni qat'iy ketma-ketlikda ulash
     dp.include_router(common_router)
+    dp.include_router(payment_flow_router)
     dp.include_router(payment_router)
     dp.include_router(admin_router)
     dp.include_router(driver_router)
@@ -99,15 +101,15 @@ async def main():
         logger.info("Bot to'liq ishlab chiqarish (production) rejimida ishga tushmoqda...")
         await dp.start_polling(bot)
     finally:
-        logger.info("Bot to'xtatilmoqda (Graceful shutdown)...")
         if miniapp_server:
             await miniapp_server.stop()
-        scheduler.stop()
+        await scheduler.shutdown()
+        await db.close()
         await bot.session.close()
-        await fsm_storage.close()
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot to'xtatildi.")
+        logger.info("Bot to'xtatildi")
