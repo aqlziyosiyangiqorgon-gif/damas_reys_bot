@@ -9,9 +9,9 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from models.callbacks import (
     DriverAlreadyDoneCallback,
     DriverArriveCenterCallback,
-    DriverDropoffCallback,
+    DriverDropoffVillageCallback,
     DriverFinishTripCallback,
-    DriverPickupCallback,
+    DriverPickupVillageCallback,
     DriverRefreshTripCallback,
     DriverRouteProgressCallback,
     DriverStartTripCallback,
@@ -33,6 +33,28 @@ def _stops_from_items(trip: dict[str, Any]) -> list[dict[str, Any]]:
             "status": "planned",
         })
     return sorted(stops.values(), key=lambda stop: (stop["route_order"], stop["village_id"]))
+
+
+def _next_home_village(items: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the next village that still has a student to deliver.
+
+    We preserve the trip item's existing order instead of inventing a new route,
+    then group students by village so the driver gets one action per stop.
+    """
+    groups: dict[int, dict[str, Any]] = {}
+    for item in items:
+        if item.get("status") == TripItemStatus.ABSENT.value:
+            continue
+        if item.get("status") == TripItemStatus.DROPPED_OFF.value:
+            continue
+        village_id = int(item["village_id"])
+        group = groups.setdefault(village_id, {
+            "village_id": village_id,
+            "village_name": item.get("village_name", f"Mahalla {village_id}"),
+            "items": [],
+        })
+        group["items"].append(item)
+    return next(iter(groups.values()), None)
 
 
 def build_driver_trip_keyboard(trip: dict[str, Any]) -> InlineKeyboardMarkup:
@@ -70,17 +92,16 @@ def build_driver_trip_keyboard(trip: dict[str, Any]) -> InlineKeyboardMarkup:
                     if int(item.get("village_id", -1)) == village_id
                     and item.get("status") == TripItemStatus.PENDING.value
                 ]
-                for item in pending:
-                    child_name = str(item.get("full_name") or "O'quvchi")
+                if pending:
                     rows.append([InlineKeyboardButton(
-                        text=f"✅ {child_name[:34]} mashinaga mindi",
-                        callback_data=DriverPickupCallback(
-                            trip_id=trip_id, item_id=int(item["id"]),
+                        text=f"✅ {village_name}: {len(pending)} ta bolani oldim"[:64],
+                        callback_data=DriverPickupVillageCallback(
+                            trip_id=trip_id, village_id=village_id,
                         ).pack(),
                     )])
-                if not pending:
+                else:
                     rows.append([InlineKeyboardButton(
-                        text=f"🚙 Bolalarni oldim · yo'lga chiqdim",
+                        text="🚙 Bolalarni oldim · keyingi mahalla",
                         callback_data=DriverRouteProgressCallback(
                             action="leave", trip_id=trip_id, village_id=village_id,
                         ).pack(),
@@ -111,26 +132,18 @@ def build_driver_trip_keyboard(trip: dict[str, Any]) -> InlineKeyboardMarkup:
                 callback_data=DriverStartTripCallback(trip_id=trip_id).pack(),
             )])
         elif status == TripStatus.ON_WAY.value:
-            for item in items:
-                item_status = item.get("status")
-                if item_status in (
-                    TripItemStatus.PENDING.value, TripItemStatus.HANDED_OVER.value,
-                    TripItemStatus.ARRIVED.value, TripItemStatus.ACCEPTED.value,
-                ):
-                    child_name = str(item.get("full_name") or "O'quvchi")
-                    rows.append([InlineKeyboardButton(
-                        text=f"🏠 {child_name[:34]} yetkazildi",
-                        callback_data=DriverDropoffCallback(
-                            trip_id=trip_id, item_id=int(item["id"]),
-                        ).pack(),
-                    )])
-                elif item_status == TripItemStatus.DROPPED_OFF.value:
-                    child_name = str(item.get("full_name") or "O'quvchi")
-                    rows.append([InlineKeyboardButton(
-                        text=f"✅ {child_name[:35]} yetkazildi",
-                        callback_data=DriverAlreadyDoneCallback(item_id=int(item["id"])).pack(),
-                    )])
-            if all(item.get("status") in (TripItemStatus.DROPPED_OFF.value, TripItemStatus.ABSENT.value) for item in items):
+            next_village = _next_home_village(items)
+            if next_village:
+                village_id = int(next_village["village_id"])
+                village_name = str(next_village["village_name"])
+                count = len(next_village["items"])
+                rows.append([InlineKeyboardButton(
+                    text=f"🏠 {village_name}: {count} ta bolani yetkazdim"[:64],
+                    callback_data=DriverDropoffVillageCallback(
+                        trip_id=trip_id, village_id=village_id,
+                    ).pack(),
+                )])
+            elif all(item.get("status") in (TripItemStatus.DROPPED_OFF.value, TripItemStatus.ABSENT.value) for item in items):
                 rows.append([InlineKeyboardButton(
                     text="🏁 Reysni yakunlash",
                     callback_data=DriverFinishTripCallback(trip_id=trip_id).pack(),
