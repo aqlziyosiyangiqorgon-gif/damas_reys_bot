@@ -106,9 +106,10 @@ async def main():
     finally:
         if miniapp_server:
             await miniapp_server.stop()
-        await scheduler.shutdown()
-        await db.close()
+        scheduler.stop()
         await bot.session.close()
+        await fsm_storage.close()
+        await db.close()
 
 
 if __name__ == "__main__":
