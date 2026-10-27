@@ -1,0 +1,103 @@
+.payment-summary-table {
+  display: grid;
+  margin: 2px 0 13px;
+  overflow: hidden;
+  border: 1px solid #e3eaf0;
+  border-radius: 16px;
+  background: #f8fafc;
+}
+
+.payment-summary-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  min-height: 42px;
+  padding: 9px 12px;
+  border-bottom: 1px solid #e8eef2;
+}
+
+.payment-summary-row:last-child { border-bottom: 0; }
+.payment-summary-row span { color: #718190; font-size: 11px; line-height: 1.35; }
+.payment-summary-row strong {
+  color: var(--brand-navy);
+  font-size: 12px;
+  font-weight: 780;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.payment-summary-row.is-active { background: #f1f7fb; }
+.payment-summary-row.is-active strong { color: var(--brand-navy); }
+.payment-summary-row.is-warning { background: #fff8e8; }
+.payment-summary-row.is-warning strong { color: #996400; }
+.payment-summary-row.is-muted strong { color: #7d8b96; font-weight: 650; }
+.payment-summary-row.is-due { background: #fff7e7; }
+.payment-summary-row.is-due strong { color: #996400; }
+.payment-summary-row.is-paid { background: #f1f8f4; }
+.payment-summary-row.is-paid strong { color: #2e7353; }
+
+.payment-tariff-editor {
+  margin-top: 4px;
+  padding: 0 12px 12px;
+  border: 1px solid #e3eaf0;
+  border-radius: 15px;
+  background: #fbfcfd;
+}
+
+.payment-tariff-editor summary {
+  min-height: 43px;
+  display: flex;
+  align-items: center;
+  color: var(--brand-navy);
+  font-size: 12px;
+  font-weight: 780;
+  cursor: pointer;
+  list-style: none;
+}
+
+.payment-tariff-editor summary::-webkit-details-marker { display: none; }
+.payment-tariff-editor summary::after { content: "＋"; margin-left: auto; font-size: 16px; font-weight: 500; }
+.payment-tariff-editor[open] summary::after { content: "−"; }
+
+.payment-tariff-helper {
+  margin: 0 0 2px;
+  color: #718190;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.payment-tariff-editor .admin-form {
+  margin-top: 11px;
+}
+
+.payment-actions {
+  display: grid;
+  gap: 10px;
+  margin-top: 13px;
+  padding-top: 13px;
+  border-top: 1px solid #edf1f4;
+}
+
+.payment-actions h4 {
+  margin: 0 0 1px;
+  color: var(--brand-navy);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.payment-actions .admin-form {
+  margin-top: 0;
+  padding: 11px;
+  border: 1px solid #e7edf1;
+  border-radius: 14px;
+  background: #f9fbfc;
+}
+
+.payment-actions .admin-form h3 { margin-top: 0; }
+.payment-tariff-editor .admin-form h3 { margin-top: 0; }
+
+@media (max-width: 390px) {
+  .payment-summary-row { grid-template-columns: minmax(0, 1fr) minmax(92px, auto); }
+  .payment-summary-row strong { font-size: 11px; }
+}

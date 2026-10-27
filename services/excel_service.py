@@ -6,7 +6,7 @@ import tempfile
 import uuid
 import openpyxl
 from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, date, time
 
 from database.db import Database, normalize_phone
 from utils.time_validation import validate_schedule_times
@@ -22,33 +22,80 @@ WEEKDAY_COLUMNS = {
 }
 
 _TIME_RANGE_RE = re.compile(
-    r"^\s*([0-9]{1,2}):([0-9]{2})\s*[-–—]\s*([0-9]{1,2}):([0-9]{2})\s*$"
+    r"^\s*([0-9]{1,2})[:.]([0-9]{2})\s*[-–—]\s*([0-9]{1,2})[:.]([0-9]{2})\s*$"
 )
+_TIME_SINGLE_RE = re.compile(r"^\s*([0-9]{1,2})[:.]([0-9]{2})\s*$")
 _TIME_RANGE_ERROR = "Vaqt oralig'i HH:MM-HH:MM ko'rinishida bo'lishi kerak"
 
 
 def _parse_time_range(value: Any) -> Tuple[str, str]:
-    """Parse a textual time range and normalize both times to HH:MM."""
-    if not isinstance(value, str):
-        raise ValueError(_TIME_RANGE_ERROR)
+    """Accept normal text plus Excel time/datetime cells and normalize to HH:MM."""
+    if isinstance(value, datetime):
+        formatted = value.strftime("%H:%M")
+        return formatted, formatted
+    if isinstance(value, time):
+        formatted = value.strftime("%H:%M")
+        return formatted, formatted
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # Excel may expose a time-only cell as a fraction of a day.
+        if 0 <= float(value) < 1:
+            total_minutes = round(float(value) * 24 * 60)
+            total_minutes %= 24 * 60
+            return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}", ""
+    text = str(value or "").strip()
+    match = _TIME_RANGE_RE.fullmatch(text)
+    if match:
+        start_hour, start_minute, end_hour, end_minute = match.groups()
+        return (
+            f"{start_hour.zfill(2)}:{start_minute}",
+            f"{end_hour.zfill(2)}:{end_minute}",
+        )
+    single = _TIME_SINGLE_RE.fullmatch(text)
+    if single:
+        hour, minute = single.groups()
+        return f"{hour.zfill(2)}:{minute}", ""
+    raise ValueError(_TIME_RANGE_ERROR)
 
-    match = _TIME_RANGE_RE.fullmatch(value)
-    if not match:
-        raise ValueError(_TIME_RANGE_ERROR)
 
-    start_hour, start_minute, end_hour, end_minute = match.groups()
-    return (
-        f"{start_hour.zfill(2)}:{start_minute}",
-        f"{end_hour.zfill(2)}:{end_minute}",
-    )
+def _excel_text(value: Any) -> str:
+    """Turn common Excel scalar types into stable user-facing text."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, (datetime, date)):
+        return value.strftime("%Y-%m-%d")
+    return str(value).strip()
+
+
+def _normalize_match_text(value: Any) -> str:
+    text = _normalize_apostrophes(_excel_text(value)).casefold()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _normalize_phone_cell(value: Any) -> Optional[str]:
+    """Handle Excel numeric cells, leading 998, spaces, punctuation and +998."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    text = _excel_text(value)
+    # Excel sometimes stores +998... as a formula-like/text value or scientific notation.
+    text = text.replace("\u00a0", " ").strip()
+    if re.fullmatch(r"[0-9]+(?:\.0+)?[Ee][+-]?[0-9]+", text, re.I):
+        try:
+            text = str(int(float(text)))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return normalize_phone(text)
+
 
 class ExcelService:
     @staticmethod
     def generate_template(output_path: Optional[str] = None) -> str:
-        """
-        Bo'sh namuna .xlsx faylini generatsiya qilish.
-        Ustunlar: F.I.Sh | Mahalla | Ota telefoni | Ona telefoni | Dushanba | Seshanba | Chorshanba | Payshanba | Juma | Shanba | Yakshanba
-        """
         if not output_path:
             stamp = now_tz().strftime("%Y%m%d_%H%M%S_%f")
             filename = f"shablon_oquvchilar_{stamp}_{uuid.uuid4().hex[:8]}.xlsx"
@@ -57,63 +104,32 @@ class ExcelService:
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "O'quvchilar"
-
         headers = [
-            "F.I.Sh",
-            "Mahalla",
-            "Ota telefoni",
-            "Ona telefoni",
-            "Dushanba",
-            "Seshanba",
-            "Chorshanba",
-            "Payshanba",
-            "Juma",
-            "Shanba",
-            "Yakshanba",
+            "F.I.Sh", "Mahalla", "Ota telefoni", "Ona telefoni",
+            "Dushanba", "Seshanba", "Chorshanba", "Payshanba",
+            "Juma", "Shanba", "Yakshanba",
         ]
         ws.append(headers)
-
-        # Namunaviy qator
-        sample_row = [
-            "Ali Valiyev",
-            "Arpaariq",
-            "+998901234567",
-            "+998907654321",
-            "09:00-11:00",
-            "",
-            "09:00-11:00",
-            "",
-            "09:00-11:00",
-            "",
-            ""
-        ]
-        ws.append(sample_row)
-
-        # Ustunlar kengligini chiroyli qilish
+        ws.append([
+            "Ali Valiyev", "Arpaariq", "+998901234567", "+998907654321",
+            "09:00-11:00", "", "09:00-11:00", "", "09:00-11:00", "", ""
+        ])
         for col in ws.columns:
             max_len = max(len(str(cell.value or "")) for cell in col)
             col_letter = openpyxl.utils.get_column_letter(col[0].column)
             ws.column_dimensions[col_letter].width = max(max_len + 3, 14)
-
         wb.save(output_path)
         return output_path
 
     @staticmethod
     async def parse_and_preview_excel(file_path: str, db: Database) -> Dict[str, Any]:
-        """
-        Excel faylni o'qish, parslash, validatsiya qilish va oldindan ko'rish hisobotini tayyorlash.
-        SATR: EXCELNI OLDINDAN KO'RISH VA XATOLARNI AJRATISH MANTIQI
-        """
         headers, sheet_rows = await asyncio.to_thread(_read_excel_rows, file_path)
 
-        # Sarlavha qatorini aniqlash (1-qator)
-        header_map = {}
-        seen_weekdays = {}
+        header_map: Dict[str, int] = {}
+        seen_weekdays: Dict[int, int] = {}
         duplicate_weekdays = set()
         for col_idx, header in enumerate(headers, 1):
-            val = _normalize_apostrophes(str(header or "")).strip().casefold()
-
-            # Weekday labels are matched by their complete normalized name.
+            val = _normalize_match_text(header)
             day_num = WEEKDAY_COLUMNS.get(val)
             if day_num is not None:
                 if day_num in seen_weekdays:
@@ -122,7 +138,6 @@ class ExcelService:
                     seen_weekdays[day_num] = col_idx
                     header_map[f"day_{day_num}"] = col_idx
                 continue
-
             if any(k in val for k in ["f.i.sh", "fish", "fio", "ism"]):
                 header_map["full_name"] = col_idx
             elif any(k in val for k in ["mahalla", "qishloq", "maktab"]):
@@ -147,77 +162,75 @@ class ExcelService:
                 for day_name, day_num in WEEKDAY_COLUMNS.items()
                 if day_num in duplicate_weekdays
             ]
-            return {
-                "new_count": 0,
-                "update_count": 0,
-                "error_count": len(errors),
-                "errors": errors,
-                "valid_records": [],
-            }
+            return {"new_count": 0, "update_count": 0, "error_count": len(errors), "errors": errors, "valid_records": []}
 
-        # Standart indekslar (agar nomlar mos kelmasa tartib bo'yicha)
         idx_name = header_map.get("full_name", 1)
         idx_village = header_map.get("village", 2)
         idx_phone1 = header_map.get("phone_1", 3)
         idx_phone2 = header_map.get("phone_2", 4)
-
         valid_records = []
         errors = []
 
         conn = await db.get_connection()
         try:
+            # Match village names/schools ourselves after normalization so Excel casing,
+            # apostrophes and extra spaces do not cause otherwise valid rows to fail.
+            villages = await db.get_villages()
+            village_by_name: Dict[str, list] = {}
+            village_by_school: Dict[str, list] = {}
+            for village in villages:
+                village_by_name.setdefault(_normalize_match_text(village.get("name")), []).append(village)
+                school = _normalize_match_text(village.get("school_name") or "")
+                if school:
+                    village_by_school.setdefault(school, []).append(village)
+
             duplicate_keys = set()
             for row_idx, row_cells in enumerate(sheet_rows, start=2):
-                # Bo'sh qator bo'lsa o'tkazib yuborish
-                if not any(value is not None and str(value).strip() for value in row_cells):
+                if not any(value is not None and _excel_text(value) for value in row_cells):
                     continue
 
-                cell_value = lambda index: row_cells[index - 1] if index <= len(row_cells) else None
-                full_name_val = _normalize_apostrophes(str(cell_value(idx_name) or "").strip())
-                village_val = _normalize_apostrophes(str(cell_value(idx_village) or "").strip())
-                phone1_val = str(cell_value(idx_phone1) or "").strip()
-                phone2_val = str(cell_value(idx_phone2) or "").strip()
+                def cell_value(index: int):
+                    return row_cells[index - 1] if index <= len(row_cells) else None
+
+                full_name_val = _normalize_apostrophes(_excel_text(cell_value(idx_name)))
+                village_val = _normalize_apostrophes(_excel_text(cell_value(idx_village)))
+                phone1_raw = _excel_text(cell_value(idx_phone1))
+                phone2_raw = _excel_text(cell_value(idx_phone2))
 
                 if not full_name_val:
                     errors.append({"row": row_idx, "full_name": "-", "error": "F.I.Sh ko'rsatilmagan"})
                     continue
-
                 if not village_val:
                     errors.append({"row": row_idx, "full_name": full_name_val, "error": "Mahalla ko'rsatilmagan"})
                     continue
 
-                norm_p1 = normalize_phone(phone1_val)
+                norm_p1 = _normalize_phone_cell(cell_value(idx_phone1))
                 if not norm_p1:
-                    errors.append({"row": row_idx, "full_name": full_name_val, "error": f"Asosiy telefon noto'g'ri: {phone1_val}"})
+                    errors.append({"row": row_idx, "full_name": full_name_val, "error": f"Asosiy telefon noto'g'ri: {phone1_raw}"})
                     continue
+                norm_p2 = _normalize_phone_cell(cell_value(idx_phone2))
 
-                norm_p2 = normalize_phone(phone2_val) if phone2_val else None
+                village_key = _normalize_match_text(village_val)
+                candidates = village_by_name.get(village_key) or village_by_school.get(village_key) or []
+                village_id = candidates[0]["id"] if len(candidates) == 1 else None
 
-                village_id = await db.match_village_by_name_or_school(village_val)
-
-                # Dars vaqtlari tekshiruvi
                 schedules = []
                 sched_error = None
                 for day_name, day_num in WEEKDAY_COLUMNS.items():
                     col_idx = header_map.get(f"day_{day_num}")
                     if col_idx is None:
                         continue
-
                     time_val = cell_value(col_idx)
-                    if time_val is None or (isinstance(time_val, str) and not time_val.strip()):
+                    if time_val is None or not _excel_text(time_val):
                         continue
-
                     try:
                         st, et = _parse_time_range(time_val)
-                    except ValueError:
-                        sched_error = _TIME_RANGE_ERROR
-                        break
-
-                    try:
+                        if not et:
+                            raise ValueError(_TIME_RANGE_ERROR)
                         validate_schedule_times(st, et)
                         schedules.append({"weekday": day_num, "start_time": st, "end_time": et})
                     except ValueError:
-                        sched_error = f"{day_name.capitalize()} soati noto'g'ri: tugash vaqti boshlanishidan keyin bo'lishi va HH:MM formatida yozilishi kerak: {time_val}"
+                        sched_error = f"{day_name.capitalize()} soati noto'g'ri: {time_val}. HH:MM-HH:MM ko'rinishida kiriting."
                         break
 
                 if sched_error:
@@ -225,11 +238,16 @@ class ExcelService:
                     continue
 
                 if not village_id:
-                    candidates = await db.suggest_villages(village_val)
+                    if len(candidates) > 1:
+                        candidate_names = [v.get("name") or v.get("school_name") for v in candidates]
+                        error = f"Mahalla bir nechta mos keldi: {', '.join(candidate_names)}"
+                    else:
+                        candidates = await db.suggest_villages(village_val)
+                        error = f"Mahalla aniq topilmadi: {village_val}"
                     errors.append({
                         "row": row_idx,
                         "full_name": full_name_val,
-                        "error": f"Mahalla aniq topilmadi: {village_val}",
+                        "error": error,
                         "candidates": candidates,
                     })
                     continue
@@ -249,16 +267,15 @@ class ExcelService:
                     "village_id": village_id,
                     "parent_phone_1": norm_p1,
                     "parent_phone_2": norm_p2,
-                    "schedules": schedules
+                    "schedules": schedules,
                 })
 
-            # Oldindan ko'rish hisoboti: Yangi va yangilanadiganlar sonini hisoblash
             new_count = 0
             update_count = 0
             for rec in valid_records:
                 cur_ex = await conn.execute(
                     "SELECT id FROM students WHERE full_name = ? AND parent_phone_1 = ?",
-                    (rec["full_name"], rec["parent_phone_1"])
+                    (rec["full_name"], rec["parent_phone_1"]),
                 )
                 if await cur_ex.fetchone():
                     update_count += 1
@@ -270,36 +287,23 @@ class ExcelService:
                 "update_count": update_count,
                 "error_count": len(errors),
                 "errors": errors,
-                "valid_records": valid_records
+                "valid_records": valid_records,
             }
         finally:
             await conn.close()
 
     @staticmethod
     async def export_students_to_excel(db: Database, output_path: Optional[str] = None) -> str:
-        """
-        Bazadagi barcha faol o'quvchilar, ularning mahallasi, telefonlari va dars jadvallarini
-        yagona chiroyli formatlangan .xlsx faylga eksport qilish.
-        """
         if not output_path:
             output_path = f"baza_oquvchilar_{now_tz().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "O'quvchilar Bazasi"
-
         headers = [
-            "F.I.Sh",
-            "Mahalla",
-            "Ota telefoni",
-            "Ona telefoni",
-            "Dushanba",
-            "Seshanba",
-            "Chorshanba",
-            "Payshanba",
-            "Juma",
-            "Shanba",
-            "Yakshanba",
+            "F.I.Sh", "Mahalla", "Ota telefoni", "Ona telefoni",
+            "Dushanba", "Seshanba", "Chorshanba", "Payshanba",
+            "Juma", "Shanba", "Yakshanba",
         ]
         ws.append(headers)
 
@@ -313,7 +317,6 @@ class ExcelService:
                 ORDER BY s.id ASC
             """)
             students = [dict(r) for r in await cur_students.fetchall()]
-
             for s in students:
                 cur_sched = await conn.execute("""
                     SELECT weekday, start_time, end_time
@@ -323,28 +326,18 @@ class ExcelService:
                 """, (s["id"],))
                 sched_rows = await cur_sched.fetchall()
                 sched_map = {row["weekday"]: f"{row['start_time']}-{row['end_time']}" for row in sched_rows}
-
-                row = [
+                ws.append([
                     _excel_safe_text(s["full_name"]),
                     _excel_safe_text(s.get("village_name") or ""),
                     _excel_safe_text(s.get("parent_phone_1") or ""),
                     _excel_safe_text(s.get("parent_phone_2") or ""),
-                    sched_map.get(0, ""),
-                    sched_map.get(1, ""),
-                    sched_map.get(2, ""),
-                    sched_map.get(3, ""),
-                    sched_map.get(4, ""),
-                    sched_map.get(5, ""),
-                    sched_map.get(6, "")
-                ]
-                ws.append(row)
-
-            # Ustunlar kengligini chiroyli qilish
+                    sched_map.get(0, ""), sched_map.get(1, ""), sched_map.get(2, ""),
+                    sched_map.get(3, ""), sched_map.get(4, ""), sched_map.get(5, ""), sched_map.get(6, ""),
+                ])
             for col in ws.columns:
                 max_len = max(len(str(cell.value or "")) for cell in col)
                 col_letter = openpyxl.utils.get_column_letter(col[0].column)
                 ws.column_dimensions[col_letter].width = max(max_len + 3, 14)
-
             wb.save(output_path)
             return output_path
         finally:
@@ -352,7 +345,6 @@ class ExcelService:
 
 
 def _excel_safe_text(value: Any) -> str:
-    """Prevent user-controlled strings from being interpreted as spreadsheet formulas."""
     text = str(value if value is not None else "")
     if text.lstrip().startswith("="):
         return "'" + text
@@ -368,7 +360,6 @@ def _read_excel_rows(file_path: str) -> Tuple[List[Any], List[Tuple[Any, ...]]]:
     extension = os.path.splitext(file_path)[1].lower()
     if extension == ".xls":
         import xlrd
-
         workbook = xlrd.open_workbook(file_path, on_demand=True)
         try:
             worksheet = workbook.sheet_by_index(0)
@@ -395,4 +386,3 @@ def _read_excel_rows(file_path: str) -> Tuple[List[Any], List[Tuple[Any, ...]]]:
         return headers, list(rows)
     finally:
         workbook.close()
-

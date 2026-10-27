@@ -10,14 +10,24 @@ from config import settings
 from database.db import Database
 from middlewares.roles import RoleMiddleware, TelegramApiFailureMiddleware, InvalidCallbackMiddleware
 from handlers.common import common_router
+from handlers.payments import payment_router
+from handlers.payment_flow import payment_flow_router
+from handlers.payment_navigation import payment_navigation_router
 from handlers.admin import admin_router
+import handlers.admin as admin_module
+from handlers.admin_menu import get_admin_menu_kb as compact_admin_menu_kb
 from handlers.driver import driver_router
+from handlers.driver_bulk import driver_bulk_router
 from handlers.staff import staff_router
 from handlers.parent import parent_router
 from services.scheduler_service import SchedulerService
 from middlewares.sqlite_storage import SQLiteFSMStorage
 from services.miniapp_server import MiniAppServer
 from aiogram.types import MenuButtonWebApp, WebAppInfo
+
+# Replace the legacy Telegram admin keyboard centrally without changing the
+# existing admin handlers. Their detailed management remains in the Mini App.
+admin_module.get_admin_menu_kb = compact_admin_menu_kb
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,8 +48,6 @@ async def log_dispatcher_error(event: ErrorEvent) -> bool:
 
 async def main():
     db_path = settings.get_db_path()
-    # Railway'da yo'qolgan Volume yoki noto'g'ri DB_PATH sababli bo'sh baza
-    # ochilib, foydalanuvchilar ro'yxati yo'qolgandek ko'rinishining oldini oladi.
     settings.validate_existing_database(db_path)
     db = Database(db_path)
     await db.init_db()
@@ -58,24 +66,23 @@ async def main():
     dp = Dispatcher(storage=fsm_storage)
     dp.errors.register(log_dispatcher_error)
 
-    # Dependency Injection
     dp["db"] = db
-
-    # Middleware: Rolni aniqlash (barcha xabar va callbacklarda)
     dp.message.middleware(RoleMiddleware(db))
     dp.callback_query.middleware(RoleMiddleware(db))
     dp.message.middleware(TelegramApiFailureMiddleware())
     dp.callback_query.middleware(TelegramApiFailureMiddleware())
     dp.callback_query.middleware(InvalidCallbackMiddleware())
 
-    # Routerlarni qat'iy ketma-ketlikda ulash
     dp.include_router(common_router)
+    dp.include_router(payment_flow_router)
+    dp.include_router(payment_navigation_router)
+    dp.include_router(payment_router)
     dp.include_router(admin_router)
+    dp.include_router(driver_bulk_router)
     dp.include_router(driver_router)
     dp.include_router(staff_router)
     dp.include_router(parent_router)
 
-    # Scheduler xizmatini ishga tushirish (APScheduler)
     scheduler = SchedulerService(db=db, bot=bot)
     dp["scheduler"] = scheduler
     scheduler.start()
@@ -97,15 +104,15 @@ async def main():
         logger.info("Bot to'liq ishlab chiqarish (production) rejimida ishga tushmoqda...")
         await dp.start_polling(bot)
     finally:
-        logger.info("Bot to'xtatilmoqda (Graceful shutdown)...")
         if miniapp_server:
             await miniapp_server.stop()
-        scheduler.stop()
+        await scheduler.shutdown()
+        await db.close()
         await bot.session.close()
-        await fsm_storage.close()
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot to'xtatildi.")
+        logger.info("Bot to'xtatildi")

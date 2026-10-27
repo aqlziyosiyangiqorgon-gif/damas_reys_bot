@@ -1,0 +1,60 @@
+.plan-guide {
+  margin: -4px 0 14px;
+  padding: 15px;
+  border: 1px solid #e2e9ee;
+  border-radius: 18px;
+  background: #ffffff;
+  box-shadow: 0 5px 18px rgba(17, 51, 73, 0.04);
+}
+
+.plan-guide-head h3 {
+  margin: 0;
+  color: var(--brand-navy, #0b4265);
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.plan-guide-head p {
+  margin: 5px 0 13px;
+  color: #718190;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.plan-step {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 10px 0;
+  border-top: 1px solid #edf1f4;
+}
+
+.plan-step-number {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: #eef5f9;
+  color: var(--brand-navy, #0b4265);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.plan-step-copy { display: grid; gap: 2px; }
+.plan-step-copy strong { color: #1f3442; font-size: 12px; }
+.plan-step-copy span { color: #718190; font-size: 11px; line-height: 1.4; }
+
+.plan-primary {
+  min-height: 46px;
+  font-weight: 800;
+}
+
+.plan-approve { min-height: 46px; }
+
+@media (max-width: 390px) {
+  .plan-guide { padding: 13px; border-radius: 16px; }
+  .plan-step { grid-template-columns: 26px minmax(0, 1fr); }
+  .plan-step-number { width: 26px; height: 26px; }
+}
